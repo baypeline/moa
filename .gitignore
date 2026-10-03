@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+pnpm-debug.log*
+
+# Build and test output
+dist/
+build/
+coverage/
+cache/
+artifacts/
+typechain-types/
+ignition/deployments/
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
