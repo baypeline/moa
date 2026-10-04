@@ -1,0 +1,676 @@
+import { useEffect, useMemo, useState, type FormEvent } from 'react';
+import { isAddress, type Address } from 'viem';
+import {
+  approveTransaction,
+  connectWallet,
+  createAccount,
+  deposit,
+  executeTransaction,
+  executeWithPayload,
+  makeIntentHash,
+  proposeTransaction,
+} from './lib/contract';
+import { config, hasAccountAddress, hasFactoryAddress } from './lib/config';
+import { getActivities, getAccountMetadata, type Activity, saveAccountMetadata, saveProposalMetadata } from './lib/api';
+
+type View = 'home' | 'create-account' | 'account' | 'create-proposal' | 'proposal-detail' | 'result';
+type ProposalStatus = 'PENDING' | 'READY' | 'EXECUTED' | 'BLOCKED';
+
+type Owner = {
+  address: string;
+  name: string;
+  approved: boolean;
+};
+
+type Account = {
+  address: Address;
+  name: string;
+  balance: string;
+  owners: Owner[];
+  threshold: number;
+};
+
+type Proposal = {
+  id: number;
+  purpose: string;
+  recipient: Address;
+  recipientLabel: string;
+  amount: string;
+  expiresAt: number;
+  status: ProposalStatus;
+  approvalCount: number;
+  threshold: number;
+  intentHash: string;
+  executionMatch: 'PASS' | 'FAIL' | null;
+};
+
+const demoOwners: Owner[] = [
+  { address: '0x1111111111111111111111111111111111111111', name: '정연한', approved: true },
+  { address: '0x2222222222222222222222222222222222222222', name: '최승원', approved: true },
+  { address: '0x3333333333333333333333333333333333333333', name: '정윤호', approved: false },
+  { address: '0x4444444444444444444444444444444444444444', name: '김다헌', approved: false },
+  { address: '0x5555555555555555555555555555555555555555', name: '유태연', approved: false },
+];
+
+const demoAccount: Account = {
+  address: '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+  name: '제주도 여행',
+  balance: '0.68',
+  owners: demoOwners,
+  threshold: 3,
+};
+
+const demoProposal: Proposal = {
+  id: 1,
+  purpose: '제주도 숙소',
+  recipient: '0x6666666666666666666666666666666666666666',
+  recipientLabel: 'Hotel A',
+  amount: '0.32',
+  expiresAt: Math.floor(Date.now() / 1000) + 3 * 24 * 60 * 60,
+  status: 'PENDING',
+  approvalCount: 2,
+  threshold: 3,
+  intentHash: '0x8c2f…a83f',
+  executionMatch: null,
+};
+
+const defaultOwners = demoOwners.map((owner) => owner.address);
+
+function shorten(value: string, size = 5) {
+  if (!value) return '연결되지 않음';
+  return value.slice(0, size + 2) + '…' + value.slice(-size);
+}
+
+function formatDate(timestamp: number) {
+  return new Intl.DateTimeFormat('ko-KR', {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(new Date(timestamp * 1000));
+}
+
+function formatKrw(amount: number) {
+  return new Intl.NumberFormat('ko-KR', {
+    style: 'currency',
+    currency: 'KRW',
+    maximumFractionDigits: 0,
+  }).format(Number.isFinite(amount) ? amount : 0);
+}
+
+function formatError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.includes('User rejected')) return '지갑 서명을 취소했어요.';
+  if (message.includes('IntentMismatch')) return '승인한 내용과 실행 요청이 달라 실행이 차단됐어요.';
+  if (message.includes('NotOwner')) return '공동계좌 참여자만 실행할 수 있어요.';
+  if (message.includes('AlreadyApproved')) return '이미 동의한 Proposal이에요.';
+  if (message.includes('InsufficientApprovals')) return '아직 승인 수가 부족해요.';
+  return message || '요청을 처리하지 못했어요.';
+}
+
+export function App() {
+  const [view, setView] = useState<View>('home');
+  const [walletAddress, setWalletAddress] = useState('');
+  const [account, setAccount] = useState<Account>({
+    ...demoAccount,
+    address: hasAccountAddress ? config.accountAddress : demoAccount.address,
+  });
+  const [proposal, setProposal] = useState<Proposal>(demoProposal);
+  const [proposals, setProposals] = useState<Proposal[]>([demoProposal]);
+  const [showActiveProposals, setShowActiveProposals] = useState(false);
+  const [showActivities, setShowActivities] = useState(false);
+  const [activities, setActivities] = useState<Activity[]>([
+    { id: '1', type: 'THRESHOLD_REACHED', createdAt: '오늘 10:34' },
+    { id: '2', type: 'PROPOSAL_APPROVED', actor: { address: demoOwners[1].address, name: '최승원' }, createdAt: '오늘 10:33' },
+    { id: '3', type: 'PROPOSAL_CREATED', actor: { address: demoOwners[0].address, name: '정연한' }, createdAt: '오늘 10:31' },
+  ]);
+  const [notice, setNotice] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
+  const [busy, setBusy] = useState('');
+  const [depositAmount, setDepositAmount] = useState('0.10');
+  const [accountName, setAccountName] = useState('제주도 여행');
+  const [ownerInputs, setOwnerInputs] = useState(defaultOwners);
+  const [proposalForm, setProposalForm] = useState({
+    purpose: '제주도 숙소',
+    recipient: demoProposal.recipient,
+    recipientLabel: 'Hotel A',
+    amount: '0.32',
+    expiresAt: new Date(demoProposal.expiresAt * 1000).toISOString().slice(0, 16),
+  });
+
+  const isLive = Boolean(walletAddress && hasAccountAddress);
+  const approvalReady = proposal.approvalCount >= proposal.threshold;
+  const expirationPass = proposal.expiresAt > Math.floor(Date.now() / 1000);
+  const currentSecurity = useMemo(() => ({
+    threshold: approvalReady,
+    intent: true,
+    expiration: expirationPass,
+    executionMatch: proposal.executionMatch,
+  }), [approvalReady, expirationPass, proposal.executionMatch]);
+
+  useEffect(() => {
+    if (!config.backendUrl || !account.address) return;
+    void getAccountMetadata(account.address).then((metadata) => {
+      if (metadata?.name) setAccount((current) => ({ ...current, name: metadata.name }));
+    }).catch(() => undefined);
+    void getActivities(account.address).then((items) => {
+      if (items.length > 0) setActivities(items);
+    }).catch(() => undefined);
+  }, [account.address]);
+
+  useEffect(() => {
+    if (!notice) return;
+
+    const timeoutId = window.setTimeout(() => {
+      setNotice(null);
+    }, 3000);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [notice]);
+
+  function setError(error: unknown) {
+    setNotice({ type: 'error', text: formatError(error) });
+  }
+
+  async function run(label: string, action: () => Promise<void>) {
+    setBusy(label);
+    setNotice(null);
+    try {
+      await action();
+    } catch (error) {
+      setError(error);
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function handleConnect() {
+    await run('connect', async () => {
+      const address = await connectWallet();
+      setWalletAddress(address);
+      setNotice({ type: 'success', text: 'Wallet이 연결됐어요.' });
+    });
+  }
+
+  async function handleCreateAccount(event: FormEvent) {
+    event.preventDefault();
+    const validOwners = ownerInputs.filter((owner) => isAddress(owner));
+    if (validOwners.length !== 5 || new Set(validOwners.map((owner) => owner.toLowerCase())).size !== 5) {
+      setNotice({ type: 'error', text: '서로 다른 유효한 Owner 주소 5개를 입력해주세요.' });
+      return;
+    }
+
+    await run('create-account', async () => {
+      if (hasFactoryAddress && walletAddress) {
+        const created = await createAccount(validOwners as Address[], 3);
+        await saveAccountMetadata(created.accountAddress, accountName, walletAddress, created.hash);
+        setAccount((current) => ({ ...current, address: created.accountAddress }));
+        setNotice({ type: 'success', text: '공동계좌 생성 Transaction이 완료됐어요.' });
+      } else {
+        setNotice({ type: 'info', text: 'Demo 모드: Contract 주소가 없어 화면에서 계좌 생성을 확인했어요.' });
+      }
+      setAccount((current) => ({
+        ...current,
+        name: accountName,
+        owners: validOwners.map((address, index) => ({
+          address,
+          name: demoOwners[index]?.name || 'Owner ' + (index + 1),
+          approved: false,
+        })),
+      }));
+      setView('account');
+    });
+  }
+
+  async function handleDeposit(event: FormEvent) {
+    event.preventDefault();
+    const amount = Number(depositAmount);
+    if (!amount || amount <= 0) {
+      setNotice({ type: 'error', text: '입금 금액을 확인해주세요.' });
+      return;
+    }
+
+    await run('deposit', async () => {
+      if (isLive) {
+        await deposit(account.address, depositAmount);
+      }
+      setAccount((current) => ({ ...current, balance: (Number(current.balance) + amount).toFixed(2) }));
+      setActivities((current) => [{ id: String(Date.now()), type: 'DEPOSIT', createdAt: '방금 전' }, ...current]);
+      setNotice({ type: 'success', text: isLive ? '입금이 완료됐어요.' : 'Demo 모드: 입금 내역을 반영했어요.' });
+    });
+  }
+
+  async function handleCreateProposal(event: FormEvent) {
+    event.preventDefault();
+    if (!isAddress(proposalForm.recipient)) {
+      setNotice({ type: 'error', text: '유효한 Recipient 주소를 입력해주세요.' });
+      return;
+    }
+    if (!Number(proposalForm.amount) || Number(proposalForm.amount) <= 0 || Number(proposalForm.amount) > Number(account.balance)) {
+      setNotice({ type: 'error', text: '금액은 0보다 크고 공동계좌 잔액 이하여야 해요.' });
+      return;
+    }
+
+    const expiresAt = Math.floor(new Date(proposalForm.expiresAt).getTime() / 1000);
+    if (!expiresAt || expiresAt <= Math.floor(Date.now() / 1000)) {
+      setNotice({ type: 'error', text: '유효기간은 현재보다 이후여야 해요.' });
+      return;
+    }
+
+    await run('create-proposal', async () => {
+      let txHash = 'demo';
+      if (isLive) {
+        txHash = await proposeTransaction(account.address, proposalForm.recipient as Address, proposalForm.amount, expiresAt);
+      }
+      const nextId = Math.max(0, ...proposals.map((item) => item.id)) + 1;
+      const intentHash = makeIntentHash(
+        account.address,
+        nextId,
+        proposalForm.recipient as Address,
+        proposalForm.amount,
+        expiresAt,
+        nextId,
+      );
+
+      const nextProposal: Proposal = {
+        id: nextId,
+        purpose: proposalForm.purpose,
+        recipient: proposalForm.recipient as Address,
+        recipientLabel: proposalForm.recipientLabel || shorten(proposalForm.recipient),
+        amount: proposalForm.amount,
+        expiresAt,
+        status: 'PENDING',
+        approvalCount: 0,
+        threshold: 3,
+        intentHash,
+        executionMatch: null,
+      };
+      setProposal(nextProposal);
+      setProposals((current) => [...current, nextProposal]);
+      setActivities((current) => [{ id: String(Date.now()), type: 'PROPOSAL_CREATED', createdAt: '방금 전' }, ...current]);
+      if (isLive) {
+        await saveProposalMetadata(account.address, nextId, proposalForm.purpose, proposalForm.recipientLabel, '', txHash);
+      }
+      setNotice({ type: 'success', text: isLive ? 'Proposal이 생성됐어요.' : 'Demo 모드: Proposal이 생성됐어요.' });
+      setView('proposal-detail');
+    });
+  }
+
+  async function handleApprove() {
+    await run('approve', async () => {
+      if (isLive) await approveTransaction(account.address, proposal.id);
+      const nextCount = Math.min(proposal.threshold, proposal.approvalCount + 1);
+      const nextProposal = {
+        ...proposal,
+        approvalCount: nextCount,
+        status: nextCount >= proposal.threshold ? 'READY' : 'PENDING',
+      } as Proposal;
+      setProposal(nextProposal);
+      setProposals((current) => current.map((item) => item.id === proposal.id ? nextProposal : item));
+      setActivities((current) => [{ id: String(Date.now()), type: nextCount >= proposal.threshold ? 'THRESHOLD_REACHED' : 'PROPOSAL_APPROVED', createdAt: '방금 전' }, ...current]);
+      setNotice({ type: 'success', text: nextCount >= proposal.threshold ? 'Threshold를 충족했어요. 지출할 수 있어요.' : '동의가 기록됐어요.' });
+    });
+  }
+
+  async function handleExecute() {
+    await run('execute', async () => {
+      if (!approvalReady) throw new Error('InsufficientApprovals');
+      if (isLive) await executeTransaction(account.address, proposal.id);
+      const nextProposal = { ...proposal, status: 'EXECUTED', executionMatch: 'PASS' } as Proposal;
+      setProposal(nextProposal);
+      setProposals((current) => current.map((item) => item.id === proposal.id ? nextProposal : item));
+      setActivities((current) => [{ id: String(Date.now()), type: 'PROPOSAL_EXECUTED', createdAt: '방금 전' }, ...current]);
+      setNotice({ type: 'success', text: '지출이 완료됐어요.' });
+      setView('result');
+    });
+  }
+
+  async function handleAttack() {
+    if (!config.attackMode) {
+      setNotice({ type: 'info', text: 'Attack Mode는 VITE_ATTACK_MODE=true일 때만 사용할 수 있어요.' });
+      return;
+    }
+
+    await run('attack', async () => {
+      const attacker = '0x9999999999999999999999999999999999999999' as Address;
+      if (isLive) await executeWithPayload(account.address, proposal.id, attacker, proposal.amount);
+      const nextProposal = { ...proposal, status: 'BLOCKED', executionMatch: 'FAIL' } as Proposal;
+      setProposal(nextProposal);
+      setProposals((current) => current.map((item) => item.id === proposal.id ? nextProposal : item));
+      setActivities((current) => [{ id: String(Date.now()), type: 'EXECUTION_BLOCKED', createdAt: '방금 전' }, ...current]);
+      setNotice({ type: 'error', text: '승인한 내용과 실행 요청이 달라 실행이 차단됐어요.' });
+      setView('result');
+    });
+  }
+
+  const nav = (next: View) => {
+    setNotice(null);
+    setView(next);
+  };
+
+  return (
+    <div className="app-shell">
+      <header className="topbar">
+        <button className="brand" onClick={() => nav('home')} aria-label="Moa 홈">
+          <span className="brand-mark">M</span>
+          <span>
+            <strong>Moa</strong>
+            <small>함께 모으고, 함께 결정하는 공동계좌</small>
+          </span>
+        </button>
+        <div className="topbar-actions">
+          <span className={'mode-pill ' + (isLive ? 'live' : '')}>
+            <i />
+            {isLive ? 'LIVE NETWORK' : 'DEMO MODE'}
+          </span>
+          <button className="wallet-button" onClick={() => void handleConnect()} disabled={busy === 'connect'}>
+            <span className="wallet-dot" />
+            {walletAddress ? shorten(walletAddress) : 'Wallet 연결'}
+          </button>
+        </div>
+      </header>
+
+      <main className="main-content">
+        {notice && <div className={'notice ' + notice.type}>{notice.text}<button onClick={() => setNotice(null)}>×</button></div>}
+
+        {view === 'home' && (
+          <HomePage account={account} proposals={proposals} onOpenAccount={() => nav('account')} onCreateAccount={() => nav('create-account')} onOpenProposal={() => nav('proposal-detail')} />
+        )}
+
+        {view === 'create-account' && (
+          <CreateAccountPage
+            name={accountName}
+            owners={ownerInputs}
+            busy={busy === 'create-account'}
+            onNameChange={setAccountName}
+            onOwnerChange={(index, value) => setOwnerInputs((current) => current.map((owner, ownerIndex) => ownerIndex === index ? value : owner))}
+            onSubmit={handleCreateAccount}
+            onBack={() => nav('home')}
+          />
+        )}
+
+        {view === 'account' && (
+          <AccountPage
+            account={account}
+            proposals={proposals}
+            activities={activities}
+            depositAmount={depositAmount}
+            busy={busy}
+            onDepositAmountChange={setDepositAmount}
+            onDeposit={handleDeposit}
+            onCreateProposal={() => nav('create-proposal')}
+            onOpenAllProposals={() => setShowActiveProposals(true)}
+            onOpenAllActivities={() => setShowActivities(true)}
+            onSelectProposal={(proposalId) => {
+              setShowActiveProposals(false);
+              const selected = proposals.find((item) => item.id === proposalId);
+              if (selected) setProposal(selected);
+              nav('proposal-detail');
+            }}
+            onBack={() => nav('home')}
+          />
+        )}
+
+        {view === 'create-proposal' && (
+          <ProposalCreatePage
+            account={account}
+            form={proposalForm}
+            busy={busy}
+            onFormChange={(key, value) => setProposalForm((current) => ({ ...current, [key]: value }))}
+            onCreate={handleCreateProposal}
+            onBack={() => nav('account')}
+          />
+        )}
+
+        {view === 'proposal-detail' && (
+          <ProposalPage
+            account={account}
+            proposal={proposal}
+            busy={busy}
+            attackMode={config.attackMode}
+            onApprove={() => void handleApprove()}
+            onExecute={() => void handleExecute()}
+            onAttack={() => void handleAttack()}
+            onBack={() => nav('account')}
+          />
+        )}
+
+        {view === 'result' && (
+          <ResultPage proposal={proposal} security={currentSecurity} onBack={() => nav('proposal-detail')} onHome={() => nav('home')} />
+        )}
+
+        {showActiveProposals && (
+          <ActiveProposalsModal
+            proposals={proposals.filter((item) => item.status === 'PENDING' || item.status === 'READY').sort((left, right) => right.id - left.id)}
+            onClose={() => setShowActiveProposals(false)}
+            onSelect={(proposalId) => {
+              setShowActiveProposals(false);
+              const selected = proposals.find((item) => item.id === proposalId);
+              if (selected) setProposal(selected);
+              nav('proposal-detail');
+            }}
+          />
+        )}
+
+        {showActivities && (
+          <ActivityModal
+            activities={activities}
+            onClose={() => setShowActivities(false)}
+          />
+        )}
+      </main>
+
+      <footer className="footer">
+        <span>MOA / 3-of-5 MULTISIG</span>
+        <span>Intent-bound execution prototype</span>
+      </footer>
+    </div>
+  );
+}
+
+function HomePage({ account, proposals, onOpenAccount, onCreateAccount, onOpenProposal }: {
+  account: Account;
+  proposals: Proposal[];
+  onOpenAccount: () => void;
+  onCreateAccount: () => void;
+  onOpenProposal: () => void;
+}) {
+  const activeProposalCount = proposals.filter((item) => item.status === 'PENDING' || item.status === 'READY').length;
+
+  return (
+    <section className="page page-home">
+      <div className="hero-grid">
+        <div className="hero-copy">
+          <p className="eyebrow">SHARED ASSET, SHARED DECISION</p>
+          <h1>함께 모으고,<br /><em>함께 결정해요.</em></h1>
+          <p className="hero-description">Moa는 충분한 서명뿐 아니라, 실제 실행이 모두가 합의한 내용과 같은지도 확인하는 공동계좌입니다.</p>
+          <div className="hero-actions">
+            <button className="primary-button" onClick={onOpenAccount}>내 공동계좌 보기 <span>↗</span></button>
+            <button className="text-button" onClick={onCreateAccount}>새 Moa 만들기 <span>＋</span></button>
+          </div>
+        </div>
+        <div className="hero-orbit">
+          <div className="orbit orbit-one" />
+          <div className="orbit orbit-two" />
+          <div className="orbit-core"><span>3</span><small>of 5</small></div>
+          <span className="orbit-label label-one">INTENT</span>
+          <span className="orbit-label label-two">APPROVAL</span>
+          <span className="orbit-label label-three">EXECUTION</span>
+        </div>
+      </div>
+
+      <div className="section-heading">
+        <div><p className="eyebrow">YOUR MOA</p><h2>내 공동계좌</h2></div>
+        <span className="count-badge">01 ACTIVE</span>
+      </div>
+
+      <button className="account-card featured-card" onClick={onOpenAccount}>
+        <div className="card-accent" />
+        <div className="account-card-top"><span className="status-dot" /> ACTIVE ACCOUNT <span className="arrow">↗</span></div>
+        <div className="account-card-title"><span>{account.name}</span><strong>{account.balance} <small>ETH</small></strong></div>
+        <div className="account-card-meta">
+          <span><b>5</b> MEMBERS</span>
+          <span><b>{account.threshold}-of-5</b> THRESHOLD</span>
+          <span><b>{activeProposalCount}</b> PENDING</span>
+        </div>
+        <div className="member-stack">
+          {account.owners.map((owner) => <span key={owner.address} title={owner.name}>{owner.name.slice(0, 1)}</span>)}
+          <label>5명이 함께하고 있어요</label>
+        </div>
+      </button>
+
+      <div className="insight-strip">
+        <div><span className="insight-icon">↯</span><span><b>이번 주 보안 상태</b><small>모든 실행 검증 통과</small></span></div>
+        <div className="insight-stat"><strong>100%</strong><small>INTENT MATCH</small></div>
+        <div className="insight-stat"><strong>0</strong><small>BLOCKED</small></div>
+        <button onClick={onOpenProposal}>Proposal 확인 <span>→</span></button>
+      </div>
+    </section>
+  );
+}
+
+function CreateAccountPage({ name, owners, busy, onNameChange, onOwnerChange, onSubmit, onBack }: {
+  name: string;
+  owners: string[];
+  busy: boolean;
+  onNameChange: (value: string) => void;
+  onOwnerChange: (index: number, value: string) => void;
+  onSubmit: (event: FormEvent) => void;
+  onBack: () => void;
+}) {
+  return (
+    <section className="page narrow-page">
+      <PageHeader eyebrow="CREATE A NEW MOA" title="새 공동계좌 만들기" description="5명의 Owner와 3명의 승인 기준으로 시작해요." onBack={onBack} />
+      <form className="form-card" onSubmit={onSubmit}>
+        <label className="field-label">공동계좌 이름<input value={name} onChange={(event) => onNameChange(event.target.value)} placeholder="예: 제주도 여행" /></label>
+        <div className="form-section-title"><span>OWNERS</span><small>5명 중 3명 동의</small></div>
+        <div className="owner-inputs">
+          {owners.map((owner, index) => <label className="owner-input" key={index}><span>{index + 1}</span><input value={owner} onChange={(event) => onOwnerChange(index, event.target.value)} placeholder="0x..." /></label>)}
+        </div>
+        <div className="threshold-preview"><span className="check-mark">✓</span><span><b>5명 중 3명이 동의하면 사용할 수 있어요.</b><small>Threshold는 MVP에서 3으로 고정돼요.</small></span></div>
+        <button className="primary-button full-width" type="submit" disabled={busy}>{busy ? '생성 중…' : 'Moa 만들기 ↗'}</button>
+      </form>
+    </section>
+  );
+}
+
+function AccountPage({ account, proposals, activities, depositAmount, busy, onDepositAmountChange, onDeposit, onCreateProposal, onOpenAllProposals, onOpenAllActivities, onSelectProposal, onBack }: {
+  account: Account;
+  proposals: Proposal[];
+  activities: Activity[];
+  depositAmount: string;
+  busy: string;
+  onDepositAmountChange: (value: string) => void;
+  onDeposit: (event: FormEvent) => void;
+  onCreateProposal: () => void;
+  onOpenAllProposals: () => void;
+  onOpenAllActivities: () => void;
+  onSelectProposal: (proposalId: number) => void;
+  onBack: () => void;
+}) {
+  const activeProposals = proposals.filter((item) => item.status === 'PENDING' || item.status === 'READY').sort((left, right) => right.id - left.id);
+
+  return (
+    <section className="page">
+      <PageHeader eyebrow="ACCOUNT OVERVIEW" title={account.name} description="5명이 함께 관리하는 공동계좌" onBack={onBack} />
+      <div className="account-overview-grid">
+        <div className="balance-card dark-card"><span className="card-kicker">CURRENT BALANCE</span><strong>{account.balance}<small> ETH</small></strong><span className="balance-sub">≈ {formatKrw(Number(account.balance) * config.nativeTokenKrwRate)} <i>TESTNET</i></span><div className="balance-actions"><div className="deposit-control"><form onSubmit={onDeposit}><input value={depositAmount} onChange={(event) => onDepositAmountChange(event.target.value)} inputMode="decimal" /><button type="submit" disabled={busy === 'deposit'}>{busy === 'deposit' ? '…' : '입금'}</button></form><span className="deposit-conversion">입금 예정 금액 <b>≈ {formatKrw(Number(depositAmount) * config.nativeTokenKrwRate)}</b></span></div></div></div>
+        <div className="consensus-column"><button className="proposal-launch standalone" onClick={onCreateProposal}>＋ 지출 제안</button><ConsensusCard account={account} activeProposals={activeProposals} onCreateProposal={onCreateProposal} onOpenAllProposals={onOpenAllProposals} onSelectProposal={onSelectProposal} /></div>
+      </div>
+      <div className="content-grid">
+        <div className="panel"><div className="panel-heading"><div><span className="eyebrow">MEMBERS</span><h3>함께하는 사람들</h3></div><span className="small-count">5 MEMBERS</span></div><div className="member-list">{account.owners.map((owner) => <div className="member-row" key={owner.address}><span className="avatar">{owner.name.slice(0, 1)}</span><span><b>{owner.name}</b><small>{shorten(owner.address)}</small></span><em className="member-online"><i />ONLINE</em></div>)}</div></div>
+        <div className="panel activity-panel"><div className="panel-heading"><div><span className="eyebrow">ACTIVITY LOG</span><h3>최근 활동</h3></div><span className="small-count">CoC</span></div><div className="timeline">{activities.slice(0, 5).map((activity) => <div className="timeline-row" key={activity.id}><span className="timeline-dot" /><span><b>{activityLabel(activity.type)}</b><small>{activity.actor?.name ? activity.actor.name + ' · ' : ''}{activity.createdAt}</small></span></div>)}</div><button className="consensus-view-all activity-view-all" onClick={onOpenAllActivities}>전체보기</button></div>
+      </div>
+    </section>
+  );
+}
+
+function ActiveProposalsModal({ proposals, onClose, onSelect }: { proposals: Proposal[]; onClose: () => void; onSelect: (proposalId: number) => void }) {
+  return <div className="modal-backdrop" role="presentation" onClick={onClose}><section className="proposal-modal" role="dialog" aria-modal="true" aria-labelledby="active-proposals-title" onClick={(event) => event.stopPropagation()}><div className="modal-header"><div><p className="eyebrow">ACTIVE PROPOSALS</p><h2 id="active-proposals-title">진행 중인 지출 제안</h2></div><button className="modal-close" onClick={onClose} aria-label="팝업 닫기">×</button></div>{proposals.length === 0 ? <div className="empty-proposals"><span>✓</span><b>진행 중인 제안이 없어요.</b><small>새 지출 제안을 만들어보세요.</small></div> : <div className="proposal-list">{proposals.map((item) => <button className="proposal-list-item" key={item.id} onClick={() => onSelect(item.id)}><span className="proposal-list-icon">↗</span><span className="proposal-list-copy"><b>{item.purpose}</b><small>{item.recipientLabel} · {item.amount} ETH</small></span><span className="proposal-list-votes">{item.approvalCount} / {item.threshold}<small>동의</small></span><span className={'status-chip ' + item.status.toLowerCase()}>{item.status === 'READY' ? 'READY' : item.status}</span><span className="proposal-list-arrow">→</span></button>)}</div>}<button className="modal-secondary" onClick={onClose}>닫기</button></section></div>;
+}
+
+function ActivityModal({ activities, onClose }: { activities: Activity[]; onClose: () => void }) {
+  return <div className="modal-backdrop" role="presentation" onClick={onClose}><section className="proposal-modal activity-modal" role="dialog" aria-modal="true" aria-labelledby="activity-modal-title" onClick={(event) => event.stopPropagation()}><div className="modal-header"><div><p className="eyebrow">ACTIVITY LOG</p><h2 id="activity-modal-title">전체 활동 내역</h2></div><button className="modal-close" onClick={onClose} aria-label="팝업 닫기">×</button></div>{activities.length === 0 ? <div className="empty-proposals"><span>✓</span><b>아직 활동 내역이 없어요.</b></div> : <div className="activity-modal-list">{activities.map((activity) => <div className="activity-modal-row" key={activity.id}><span className="timeline-dot" /><span><b>{activityLabel(activity.type)}</b><small>{activity.actor?.name ? activity.actor.name + ' · ' : ''}{activity.createdAt}</small></span></div>)}</div>}<button className="modal-secondary" onClick={onClose}>닫기</button></section></div>;
+}
+
+function ConsensusCard({ account, activeProposals, onCreateProposal, onOpenAllProposals, onSelectProposal }: { account: Account; activeProposals: Proposal[]; onCreateProposal: () => void; onOpenAllProposals: () => void; onSelectProposal: (proposalId: number) => void }) {
+  const hasActiveProposal = activeProposals.length > 0;
+  const visibleProposals = activeProposals.slice(0, 3);
+
+  return <div className="threshold-card consensus-card"><div className="card-heading"><span>CONSENSUS</span><span className="live-badge">{activeProposals.length} ACTIVE</span></div>{hasActiveProposal ? <><div className="active-proposal-label">ALL ACTIVE PROPOSALS</div><div className="consensus-proposal-list">{visibleProposals.map((item) => <button className="consensus-proposal-row" key={item.id} onClick={() => onSelectProposal(item.id)}><span className="consensus-proposal-icon">↗</span><span className="consensus-proposal-copy"><b>{item.purpose}</b><small>{item.recipientLabel} · {item.amount} ETH</small></span><span className="consensus-proposal-votes"><b>{item.approvalCount} / {item.threshold}</b><small>동의</small></span><span className={'status-chip ' + item.status.toLowerCase()}>{item.status === 'READY' ? 'READY' : item.status}</span><span className="consensus-proposal-progress">{account.owners.map((owner, index) => <i key={owner.address} className={index < item.approvalCount ? 'approved' : ''} />)}</span></button>)}</div><button className="consensus-view-all" onClick={onOpenAllProposals}>전체보기</button></> : <button className="consensus-empty" onClick={onCreateProposal}><span>＋</span><b>새 지출 제안을 만들어보세요</b><small>클릭해서 Proposal을 작성할 수 있어요.</small></button>}</div>;
+}
+
+function ProposalCreatePage({ account, form, busy, onFormChange, onCreate, onBack }: {
+  account: Account;
+  form: { purpose: string; recipient: string; recipientLabel: string; amount: string; expiresAt: string };
+  busy: string;
+  onFormChange: (key: string, value: string) => void;
+  onCreate: (event: FormEvent) => void;
+  onBack: () => void;
+}) {
+  return <section className="page narrow-page"><PageHeader eyebrow="NEW PROPOSAL" title="새 지출 제안" description="공동자금을 사용할 거래 조건을 작성해요." onBack={onBack} /><form className="proposal-create-card proposal-create-page-card" onSubmit={onCreate}><div className="proposal-form-heading"><span className="eyebrow">PROPOSAL INTENT</span><span className="step-label">01 / 01</span></div><div className="proposal-form-grid"><label>목적<input value={form.purpose} onChange={(event) => onFormChange('purpose', event.target.value)} placeholder="예: 제주도 숙소" /></label><label>금액<div className="input-suffix"><input value={form.amount} onChange={(event) => onFormChange('amount', event.target.value)} inputMode="decimal" /><span>ETH</span></div></label><label className="wide-field">받는 곳<input value={form.recipient} onChange={(event) => onFormChange('recipient', event.target.value)} placeholder="0x..." /></label><label>표시 이름<input value={form.recipientLabel} onChange={(event) => onFormChange('recipientLabel', event.target.value)} placeholder="예: Hotel A" /></label><label>유효기간<input type="datetime-local" value={form.expiresAt} onChange={(event) => onFormChange('expiresAt', event.target.value)} /></label></div><div className="proposal-form-footer"><span>잔액 {account.balance} ETH · TRANSFER</span><button className="primary-button" type="submit" disabled={busy === 'create-proposal'}>{busy === 'create-proposal' ? '생성 중…' : 'Proposal 만들기 ↗'}</button></div></form></section>;
+}
+
+function ProposalPage({ account, proposal, busy, attackMode, onApprove, onExecute, onAttack, onBack }: {
+  account: Account;
+  proposal: Proposal;
+  busy: string;
+  attackMode: boolean;
+  onApprove: () => void;
+  onExecute: () => void;
+  onAttack: () => void;
+  onBack: () => void;
+}) {
+  const ready = proposal.approvalCount >= proposal.threshold;
+  const isResult = proposal.status === 'EXECUTED' || proposal.status === 'BLOCKED';
+
+  return (
+    <section className="page">
+      <PageHeader eyebrow={isResult ? 'EXECUTION RESULT' : 'PROPOSAL DETAIL'} title={isResult ? (proposal.status === 'EXECUTED' ? '지출이 완료됐어요.' : '실행이 차단됐어요.') : proposal.purpose} description={isResult ? '검증 결과를 확인해보세요.' : '거래 조건과 구성원 승인 현황을 확인해요.'} onBack={onBack} />
+      <div className="proposal-detail-grid">
+        <div className="proposal-main-card">
+          <div className="proposal-card-top"><span className={'status-chip ' + proposal.status.toLowerCase()}>{proposal.status === 'READY' ? 'EXECUTABLE' : proposal.status}</span><span className="proposal-id">PROPOSAL #{String(proposal.id).padStart(2, '0')}</span></div>
+          <h3>{proposal.purpose}</h3><strong className="proposal-amount">{proposal.amount}<small> ETH</small></strong>
+          <div className="recipient-block"><span>RECIPIENT</span><b>{proposal.recipientLabel}</b><code>{shorten(proposal.recipient, 8)}</code></div>
+          <div className="proposal-meta-row"><span><small>EXPIRES</small><b>{formatDate(proposal.expiresAt)}</b></span><span><small>ACTION</small><b>TRANSFER</b></span><span><small>INTENT HASH</small><b>{proposal.intentHash}</b></span></div>
+          <div className="approval-progress"><div className="progress-label"><span>구성원 승인</span><b>{proposal.approvalCount} / {proposal.threshold}</b></div><div className="progress-track"><i style={{ width: Math.min(100, proposal.approvalCount / proposal.threshold * 100) + '%' }} /></div></div>
+          <div className="approval-avatars">{account.owners.map((owner, index) => <span className={index < proposal.approvalCount ? 'approved' : ''} key={owner.address}>{owner.name.slice(0, 1)}</span>)}</div>
+          {!isResult && <div className="action-row"><button className="secondary-button" onClick={onApprove} disabled={busy === 'approve' || ready}>{busy === 'approve' ? '서명 중…' : ready ? '동의 완료 ✓' : '동의하기'}</button><button className="primary-button" onClick={onExecute} disabled={!ready || busy === 'execute'}>{busy === 'execute' ? '실행 중…' : '실행하기 ↗'}</button></div>}
+        </div>
+
+        <div className="security-card"><div className="card-heading"><span>SECURITY LAYER</span><span className="lock-icon">⌁</span></div><p className="security-lead">서명은 충분했지만,<br /><b>합의한 거래인지 다시 확인해요.</b></p><SecurityRow label="Threshold" status={proposal.approvalCount >= proposal.threshold ? 'PASS' : 'WAIT'} value={proposal.approvalCount + ' / ' + proposal.threshold} /><SecurityRow label="Intent" status="PASS" value={shorten(proposal.intentHash, 7)} /><SecurityRow label="Expiration" status={proposal.expiresAt > Math.floor(Date.now() / 1000) ? 'PASS' : 'FAIL'} value={formatDate(proposal.expiresAt)} /><SecurityRow label="Execution Match" status={proposal.executionMatch || 'WAIT'} value={proposal.executionMatch === 'FAIL' ? 'Recipient mismatch' : proposal.executionMatch === 'PASS' ? 'All fields match' : '검증 대기'} />{attackMode && !isResult && ready && <button className="attack-button" onClick={onAttack} disabled={busy === 'attack'}><span>⚠</span>{busy === 'attack' ? '공격 시뮬레이션 중…' : 'Attack Path 실행'}</button>}</div>
+      </div>
+    </section>
+  );
+}
+
+function ResultPage({ proposal, security, onBack, onHome }: {
+  proposal: Proposal;
+  security: { threshold: boolean; intent: boolean; expiration: boolean; executionMatch: 'PASS' | 'FAIL' | null };
+  onBack: () => void;
+  onHome: () => void;
+}) {
+  const blocked = proposal.status === 'BLOCKED';
+  return <section className="page result-page"><div className={'result-icon ' + (blocked ? 'blocked' : 'success')}>{blocked ? '!' : '✓'}</div><p className="eyebrow">{blocked ? 'EXECUTION BLOCKED' : 'TRANSACTION EXECUTED'}</p><h1>{blocked ? '실행이 차단됐어요.' : '지출이 완료됐어요.'}</h1><p className="result-description">{blocked ? '승인한 내용과 실제 실행 요청이 일치하지 않습니다.' : '모든 구성원이 합의한 내용으로 자산이 이동했습니다.'}</p>{blocked && <div className="mismatch-card"><div><span>승인한 대상</span><b>{proposal.recipientLabel}</b><code>{shorten(proposal.recipient)}</code></div><span className="mismatch-arrow">≠</span><div><span>실제 요청</span><b>Unknown</b><code>0x9999…9999</code></div></div>}<div className="result-checks"><SecurityRow label="Threshold" status={security.threshold ? 'PASS' : 'FAIL'} value={proposal.approvalCount + ' / ' + proposal.threshold} /><SecurityRow label="Intent" status={security.intent ? 'PASS' : 'FAIL'} value="승인된 Intent" /><SecurityRow label="Expiration" status={security.expiration ? 'PASS' : 'FAIL'} value={security.expiration ? '유효함' : '만료됨'} /><SecurityRow label="Execution Match" status={security.executionMatch || 'WAIT'} value={blocked ? 'Recipient mismatch' : 'All fields match'} /></div><div className="result-actions"><button className="secondary-button" onClick={onBack}>Proposal로 돌아가기</button><button className="primary-button" onClick={onHome}>Home으로 이동 ↗</button></div></section>;
+}
+
+function SecurityRow({ label, status, value }: { label: string; status: string; value: string }) {
+  return <div className="security-row"><span className="security-status">{status === 'PASS' ? '✓' : status === 'FAIL' ? '×' : '·'}</span><span><b>{label}</b><small>{value}</small></span><em className={status.toLowerCase()}>{status}</em></div>;
+}
+
+function PageHeader({ eyebrow, title, description, onBack }: { eyebrow: string; title: string; description: string; onBack: () => void }) {
+  return <div className="page-header"><button className="back-button" onClick={onBack}>← BACK</button><p className="eyebrow">{eyebrow}</p><h1>{title}</h1><p>{description}</p></div>;
+}
+
+function activityLabel(type: string) {
+  const labels: Record<string, string> = {
+    ACCOUNT_CREATED: '공동계좌 생성',
+    DEPOSIT: '공동계좌 입금',
+    PROPOSAL_CREATED: '지출 제안 생성',
+    PROPOSAL_APPROVED: '구성원 승인',
+    THRESHOLD_REACHED: 'Threshold 충족',
+    EXECUTION_REQUESTED: '실행 요청',
+    EXECUTION_BLOCKED: '실행 차단',
+    PROPOSAL_EXECUTED: '지출 실행 완료',
+  };
+  return labels[type] || type;
+}

@@ -9,6 +9,8 @@
     "pnpm": ">=11.0.0"
   },
   "scripts": {
+    "frontend:dev": "pnpm --filter @moa/frontend run dev",
+    "frontend:build": "pnpm --filter @moa/frontend run build",
     "contracts:compile": "pnpm --filter @moa/contracts run compile",
     "contracts:test": "pnpm --filter @moa/contracts run test",
     "contracts:typecheck": "pnpm --filter @moa/contracts run typecheck",
