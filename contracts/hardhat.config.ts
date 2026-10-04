@@ -1,5 +1,5 @@
 import hardhatToolboxViem from "@nomicfoundation/hardhat-toolbox-viem";
-import { defineConfig } from "hardhat/config";
+import { configVariable, defineConfig } from "hardhat/config";
 
 export default defineConfig({
   plugins: [hardhatToolboxViem],
@@ -10,6 +10,15 @@ export default defineConfig({
         enabled: true,
         runs: 200,
       },
+    },
+  },
+  networks: {
+    sepolia: {
+      type: "http",
+      chainType: "l1",
+      chainId: 11155111,
+      url: configVariable("SEPOLIA_RPC_URL"),
+      accounts: [configVariable("SEPOLIA_PRIVATE_KEY")],
     },
   },
 });

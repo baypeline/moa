@@ -62,3 +62,24 @@ pnpm contracts:compile
 pnpm contracts:typecheck
 pnpm contracts:test
 ```
+
+## Sepolia 설정
+
+Sepolia 배포 설정은 비밀값을 소스에 저장하지 않고 Hardhat Keystore에서 읽습니다.
+
+- `SEPOLIA_RPC_URL`: Sepolia RPC 공급자가 발급한 HTTPS URL
+- `SEPOLIA_PRIVATE_KEY`: Sepolia 배포 전용 MetaMask 계정의 개인키
+
+개인키는 저장소, `.env`, 채팅에 기록하지 않습니다. 실제 값은 배포 준비 단계에서 다음 명령으로 로컬 Keystore에 입력합니다.
+
+```bash
+cd contracts
+pnpm hardhat keystore set SEPOLIA_RPC_URL
+pnpm hardhat keystore set SEPOLIA_PRIVATE_KEY
+```
+
+Sepolia 네트워크 설정값은 다음과 같습니다.
+
+- Chain ID: `11155111`
+- 통화 기호: `ETH`
+- 블록 탐색기: `https://sepolia.etherscan.io`
