@@ -7,11 +7,11 @@ Moa는 5명의 참여자가 공동 자산을 관리하고, 3명 이상의 승인
 ```text
 moa/
 ├── frontend/   # 프론트엔드 (추후 구현)
-├── backend/    # 백엔드 (추후 구현)
+├── backend/    # NestJS metadata API
 └── contracts/  # Solidity 스마트 컨트랙트
 ```
 
-워크스페이스는 pnpm으로 관리합니다. 현재 `frontend`와 `backend`는 자리만 마련되어 있으며, `contracts`에는 3-of-5 멀티시그 계좌와 팩토리가 구현되어 있습니다.
+워크스페이스는 pnpm으로 관리합니다. 현재 `frontend`는 자리만 마련되어 있으며, `backend`에는 off-chain metadata API가 구현되어 있고, `contracts`에는 3-of-5 멀티시그 계좌와 팩토리가 구현되어 있습니다.
 
 컨트랙트의 공개 함수와 보안 모델은 [`contracts/README.md`](contracts/README.md)에서 확인할 수 있습니다.
 
