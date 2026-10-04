@@ -83,3 +83,17 @@ Sepolia 네트워크 설정값은 다음과 같습니다.
 - Chain ID: `11155111`
 - 통화 기호: `ETH`
 - 블록 탐색기: `https://sepolia.etherscan.io`
+
+## 배포
+
+`MoaFactory`는 Hardhat Ignition 모듈로 배포합니다. 실제 네트워크에 배포하기 전에 인메모리 로컬 네트워크에서 전체 배포 과정을 검증합니다.
+
+```bash
+# 저장소 루트
+pnpm contracts:deploy:local
+
+# Sepolia
+pnpm contracts:deploy:sepolia
+```
+
+로컬 배포 주소는 실행이 끝나면 사라지는 테스트 주소입니다. Sepolia 배포 주소와 트랜잭션 해시는 실제 배포가 성공한 후 별도로 기록합니다.
