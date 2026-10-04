@@ -96,4 +96,13 @@ pnpm contracts:deploy:local
 pnpm contracts:deploy:sepolia
 ```
 
-로컬 배포 주소는 실행이 끝나면 사라지는 테스트 주소입니다. Sepolia 배포 주소와 트랜잭션 해시는 실제 배포가 성공한 후 별도로 기록합니다.
+로컬 배포 주소는 실행이 끝나면 사라지는 테스트 주소입니다.
+
+### Sepolia 배포 정보
+
+- 네트워크: Ethereum Sepolia (`11155111`)
+- `MoaFactory`: [`0x33d4123ac88792CFe81A8Ae818760C8008d29747`](https://sepolia.etherscan.io/address/0x33d4123ac88792CFe81A8Ae818760C8008d29747)
+- 배포 트랜잭션: [`0xec5e6053df2769b9c34e89e8651a09441498695e60cc600a07fa029219415ca2`](https://sepolia.etherscan.io/tx/0xec5e6053df2769b9c34e89e8651a09441498695e60cc600a07fa029219415ca2)
+- 배포 블록: `11842073`
+
+Ignition 배포 기록은 `ignition/deployments/chain-11155111`에서 관리합니다.
