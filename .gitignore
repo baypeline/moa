@@ -24,3 +24,6 @@ ignition/deployments/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# TypeScript cache
+*.tsbuildinfo
