@@ -11,7 +11,9 @@ moa/
 └── contracts/  # Solidity 스마트 컨트랙트
 ```
 
-워크스페이스는 pnpm으로 관리합니다. 현재 `frontend`는 자리만 마련되어 있으며, `backend`에는 off-chain metadata API가 구현되어 있습니다. `contracts`는 Hardhat 개발 환경만 설정되어 있고 실제 Contract 연동은 대기 중입니다. Backend 실행과 API 계약은 [backend/README.md](backend/README.md)를 참고하세요.
+워크스페이스는 pnpm으로 관리합니다. 현재 `frontend`는 자리만 마련되어 있으며, `backend`에는 off-chain metadata API가 구현되어 있고, `contracts`에는 3-of-5 멀티시그 계좌와 팩토리가 구현되어 있습니다.
+
+컨트랙트의 공개 함수와 보안 모델은 [`contracts/README.md`](contracts/README.md)에서 확인할 수 있습니다.
 
 ## 요구 환경
 

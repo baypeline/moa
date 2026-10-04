@@ -1,0 +1,64 @@
+# Moa Contracts
+
+Moa의 네이티브 자산용 3-of-5 멀티시그 계좌 구현입니다.
+
+## 구성
+
+- `MoaFactory`: 다섯 Owner로 새 공동계좌 생성 및 Owner별 계좌 인덱싱
+- `MoaAccount`: 입금, 지출 제안, 승인, 취소, Intent 검증 및 실행
+- `mocks/ExecutionTarget`: 실행 성공·실패 테스트용 컨트랙트
+
+## 상태 전이
+
+```text
+Pending ── executeProposal ──> Executed
+   │
+   └──── cancelProposal ─────> Cancelled
+```
+
+- 제안 생성자는 자동 승인되지 않음
+- 서로 다른 Owner 세 명의 승인 필요
+- 실행 및 취소가 끝난 제안은 다시 승인하거나 실행할 수 없음
+- 취소는 Pending 상태에서 제안자만 가능
+
+## Intent 검증
+
+제안 생성 시 다음 값을 묶어 `intentHash`로 저장합니다.
+
+```text
+account address
+chain ID
+proposal ID
+target
+value
+keccak256(data)
+```
+
+실행 시 전달받은 `target`, `value`, `data`로 해시를 다시 계산합니다. 승인된 해시와 다르면 `IntentMismatch`로 실행을 차단합니다.
+
+## 주요 함수
+
+### MoaFactory
+
+- `createAccount(address[5] owners)`: 호출자를 포함하는 5인 공동계좌 생성
+- `accountsOf(address owner)`: Owner가 참여하는 계좌 목록 조회
+- `accountAt(uint256 index)`: 생성 순서 기준 계좌 조회
+
+### MoaAccount
+
+- `createProposal(address target, uint256 value, bytes data)`: 지출 Intent 생성
+- `approveProposal(uint256 proposalId)`: Owner 승인 기록
+- `executeProposal(uint256 proposalId, address target, uint256 value, bytes data)`: 승인 수와 Intent를 검증한 후 실행
+- `cancelProposal(uint256 proposalId)`: 제안자가 Pending 제안 취소
+- `getProposal(uint256 proposalId)`: 제안 상세 조회
+- `hasApproved(uint256 proposalId, address owner)`: Owner 승인 여부 조회
+
+## 검증
+
+저장소 루트에서 다음 명령을 실행합니다.
+
+```bash
+pnpm contracts:compile
+pnpm contracts:typecheck
+pnpm contracts:test
+```
