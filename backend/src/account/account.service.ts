@@ -26,7 +26,19 @@ export class AccountService {
       where: addresses ? { address: { in: addresses } } : undefined,
       orderBy: [{ createdAt: 'desc' }, { address: 'asc' }],
     });
-    return { ...this.blockchain.metadataContext(), items };
+    if (addresses === undefined)
+      return { ...this.blockchain.metadataContext(), items };
+    return {
+      ...this.blockchain.readContext(),
+      items: await Promise.all(
+        addresses.map(async (address) => {
+          const metadata =
+            items.find((item) => item.address === address) ?? null;
+          const state = await this.blockchain.getAccountState(address);
+          return { ...metadata, address, metadata, state };
+        }),
+      ),
+    };
   }
   async requireMetadata(address: string) {
     const metadata = await this.prisma.accountMetadata.findUnique({
@@ -41,8 +53,12 @@ export class AccountService {
   }
   async get(address: string) {
     return {
-      ...this.blockchain.metadataContext(),
-      metadata: await this.requireMetadata(address),
+      ...this.blockchain.readContext(),
+      state: await this.blockchain.getAccountState(address),
+      metadata:
+        (await this.prisma.accountMetadata.findUnique({
+          where: { address: normalizeAddress(address) },
+        })) ?? null,
     };
   }
   async create(dto: CreateAccountDto) {

@@ -16,14 +16,35 @@ export class ProposalService {
     private readonly blockchain: BlockchainService,
   ) {}
   async list(address: string) {
-    await this.accounts.requireMetadata(address);
-    return {
-      ...this.blockchain.metadataContext(),
-      items: await this.prisma.proposalMetadata.findMany({
-        where: { accountAddress: normalizeAddress(address) },
-        orderBy: [{ createdAt: 'desc' }, { proposalId: 'asc' }],
-      }),
-    };
+    const state = await this.blockchain.getAccountState(address);
+    const metadata = await this.prisma.proposalMetadata.findMany({
+      where: { accountAddress: normalizeAddress(address) },
+      orderBy: [{ createdAt: 'desc' }, { proposalId: 'asc' }],
+    });
+    // Read all on-chain proposals, including those with no metadata. Bound RPC concurrency.
+    const items: Awaited<ReturnType<ProposalService['get']>>[] = [];
+    for (let start = 0n; start < state.proposalCount; start += 10n) {
+      const ids: string[] = [];
+      for (let id = start; id < start + 10n && id < state.proposalCount; id++)
+        ids.push(id.toString());
+      items.push(
+        ...(await Promise.all(
+          ids.map(async (id) => {
+            const item =
+              metadata.find((item) => item.proposalId === id) ?? null;
+            return {
+              ...item,
+              ...this.blockchain.readContext(),
+              accountAddress: normalizeAddress(address),
+              proposalId: id,
+              state: await this.blockchain.getProposalState(address, id),
+              metadata: item,
+            };
+          }),
+        )),
+      );
+    }
+    return { ...this.blockchain.readContext(), items };
   }
   async requireMetadata(address: string, proposalId: string) {
     await this.accounts.requireMetadata(address);
@@ -44,8 +65,17 @@ export class ProposalService {
   }
   async get(address: string, proposalId: string) {
     return {
-      ...this.blockchain.metadataContext(),
-      metadata: await this.requireMetadata(address, proposalId),
+      ...this.blockchain.readContext(),
+      state: await this.blockchain.getProposalState(address, proposalId),
+      metadata:
+        (await this.prisma.proposalMetadata.findUnique({
+          where: {
+            accountAddress_proposalId: {
+              accountAddress: normalizeAddress(address),
+              proposalId,
+            },
+          },
+        })) ?? null,
     };
   }
   async create(address: string, dto: CreateProposalDto) {
