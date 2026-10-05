@@ -28,6 +28,11 @@ const localChain = {
 
 export const factoryAbi = [
   {
+    type: 'error',
+    name: 'CreatorNotOwner',
+    inputs: [{ name: 'creator', type: 'address' }],
+  },
+  {
     type: 'function',
     name: 'createAccount',
     stateMutability: 'nonpayable',
@@ -35,6 +40,13 @@ export const factoryAbi = [
       { name: 'owners', type: 'address[5]' },
     ],
     outputs: [{ name: 'account', type: 'address' }],
+  },
+  {
+    type: 'function',
+    name: 'accountsOf',
+    stateMutability: 'view',
+    inputs: [{ name: 'owner', type: 'address' }],
+    outputs: [{ name: '', type: 'address[]' }],
   },
   {
     type: 'event',
@@ -49,6 +61,54 @@ export const factoryAbi = [
 ] as const;
 
 export const accountAbi = [
+  {
+    type: 'error',
+    name: 'NotOwner',
+    inputs: [{ name: 'caller', type: 'address' }],
+  },
+  {
+    type: 'error',
+    name: 'ProposalNotFound',
+    inputs: [{ name: 'proposalId', type: 'uint256' }],
+  },
+  {
+    type: 'error',
+    name: 'ProposalNotPending',
+    inputs: [{ name: 'proposalId', type: 'uint256' }],
+  },
+  {
+    type: 'error',
+    name: 'AlreadyApproved',
+    inputs: [
+      { name: 'proposalId', type: 'uint256' },
+      { name: 'owner', type: 'address' },
+    ],
+  },
+  {
+    type: 'error',
+    name: 'InsufficientApprovals',
+    inputs: [
+      { name: 'proposalId', type: 'uint256' },
+      { name: 'current', type: 'uint256' },
+      { name: 'required', type: 'uint256' },
+    ],
+  },
+  {
+    type: 'error',
+    name: 'IntentMismatch',
+    inputs: [
+      { name: 'expected', type: 'bytes32' },
+      { name: 'actual', type: 'bytes32' },
+    ],
+  },
+  {
+    type: 'error',
+    name: 'InsufficientBalance',
+    inputs: [
+      { name: 'available', type: 'uint256' },
+      { name: 'required', type: 'uint256' },
+    ],
+  },
   {
     type: 'function',
     name: 'owners',
@@ -233,6 +293,15 @@ export async function readAccountState(accountAddress: Address) {
   };
 }
 
+export async function readFactoryAccounts(owner: Address) {
+  return publicClient.readContract({
+    address: config.factoryAddress,
+    abi: factoryAbi,
+    functionName: 'accountsOf',
+    args: [owner],
+  });
+}
+
 export async function readProposal(accountAddress: Address, proposalId: number) {
   return publicClient.readContract({
     address: accountAddress,
@@ -278,9 +347,22 @@ export function getWalletClient() {
   });
 }
 
+async function getSupportedWalletClient() {
+  const walletClient = getWalletClient();
+  const chainId = await walletClient.getChainId();
+  if (chainId !== config.chainId) {
+    throw new Error(`지원 네트워크가 아닙니다. 지갑 네트워크를 Chain ID ${config.chainId}로 변경해주세요.`);
+  }
+  return walletClient;
+}
+
 export async function connectWallet() {
   const walletClient = getWalletClient();
   const [address] = await walletClient.requestAddresses();
+  const chainId = await walletClient.getChainId();
+  if (chainId !== config.chainId) {
+    throw new Error(`지원 네트워크가 아닙니다. 지갑 네트워크를 Chain ID ${config.chainId}로 변경해주세요.`);
+  }
   return address;
 }
 
@@ -291,7 +373,7 @@ async function waitForTransaction(client: WalletClient, hash: Hex) {
 
 export async function createAccount(owners: Address[]) {
   if (owners.length !== 5) throw new Error('공동계좌에는 Owner 5명이 필요합니다.');
-  const walletClient = getWalletClient();
+  const walletClient = await getSupportedWalletClient();
   const [account] = await walletClient.getAddresses();
   const { request } = await publicClient.simulateContract({
     address: config.factoryAddress,
@@ -309,7 +391,7 @@ export async function createAccount(owners: Address[]) {
 }
 
 export async function deposit(accountAddress: Address, amount: string) {
-  const walletClient = getWalletClient();
+  const walletClient = await getSupportedWalletClient();
   const [account] = await walletClient.getAddresses();
   const hash = await walletClient.sendTransaction({
     account,
@@ -324,7 +406,7 @@ export async function createProposal(
   recipient: Address,
   amount: string,
 ) {
-  const walletClient = getWalletClient();
+  const walletClient = await getSupportedWalletClient();
   const [account] = await walletClient.getAddresses();
   const hash = await walletClient.writeContract({
     address: accountAddress,
@@ -341,7 +423,7 @@ export async function createProposal(
 }
 
 export async function approveTransaction(accountAddress: Address, proposalId: number) {
-  const walletClient = getWalletClient();
+  const walletClient = await getSupportedWalletClient();
   const [account] = await walletClient.getAddresses();
   const hash = await walletClient.writeContract({
     address: accountAddress,
@@ -354,7 +436,7 @@ export async function approveTransaction(accountAddress: Address, proposalId: nu
 }
 
 export async function executeTransaction(accountAddress: Address, proposalId: number) {
-  const walletClient = getWalletClient();
+  const walletClient = await getSupportedWalletClient();
   const [account] = await walletClient.getAddresses();
   const proposal = await readProposal(accountAddress, proposalId);
   const hash = await walletClient.writeContract({
@@ -373,7 +455,7 @@ export async function executeWithPayload(
   recipient: Address,
   amount: string,
 ) {
-  const walletClient = getWalletClient();
+  const walletClient = await getSupportedWalletClient();
   const [account] = await walletClient.getAddresses();
   const hash = await walletClient.writeContract({
     address: accountAddress,

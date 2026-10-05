@@ -11,6 +11,7 @@ import {
   makeIntentHash,
   readAccountState,
   readApproval,
+  readFactoryAccounts,
   readProposal,
   readProposalCount,
 } from './lib/contract';
@@ -115,6 +116,24 @@ function formatError(error: unknown) {
   return message || '요청을 처리하지 못했어요.';
 }
 
+function hasContractError(error: unknown, name: string) {
+  const messages: string[] = [];
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current; depth += 1) {
+    if (current instanceof Error) messages.push(current.message);
+    if (typeof current === 'object' && current !== null && 'shortMessage' in current) {
+      messages.push(String((current as { shortMessage?: unknown }).shortMessage));
+    }
+    if (typeof current === 'object' && current !== null && 'details' in current) {
+      messages.push(String((current as { details?: unknown }).details));
+    }
+    current = typeof current === 'object' && current !== null && 'cause' in current
+      ? (current as { cause?: unknown }).cause
+      : null;
+  }
+  return messages.some((message) => message.includes(name));
+}
+
 export function App() {
   const [view, setView] = useState<View>('home');
   const [walletAddress, setWalletAddress] = useState('');
@@ -133,6 +152,7 @@ export function App() {
   ]);
   const [notice, setNotice] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
   const [busy, setBusy] = useState('');
+  const [liveRefreshKey, setLiveRefreshKey] = useState(0);
   const [depositAmount, setDepositAmount] = useState('0.10');
   const [accountName, setAccountName] = useState('제주도 여행');
   const [ownerInputs, setOwnerInputs] = useState(defaultOwners);
@@ -165,13 +185,23 @@ export function App() {
   }, [account.address]);
 
   useEffect(() => {
+    if (!walletAddress || !hasFactoryAddress || hasAccountAddress || account.address !== demoAccount.address) return;
+    let disposed = false;
+    void readFactoryAccounts(walletAddress as Address).then((accounts) => {
+      if (disposed || accounts.length === 0) return;
+      setAccount((current) => ({ ...current, address: accounts[accounts.length - 1] }));
+    }).catch(() => undefined);
+    return () => { disposed = true; };
+  }, [walletAddress, account.address]);
+
+  useEffect(() => {
     if (!isLive) return;
     let disposed = false;
     async function syncLiveState() {
       const [state, proposalCount, metadata] = await Promise.all([
         readAccountState(account.address),
         readProposalCount(account.address),
-        getProposalMetadataList(account.address),
+        getProposalMetadataList(account.address).catch(() => []),
       ]);
       const records = await Promise.all(
         Array.from({ length: Number(proposalCount) }, (_, proposalId) => readProposal(account.address, proposalId)),
@@ -224,7 +254,7 @@ export function App() {
 
     void syncLiveState().catch(() => undefined);
     return () => { disposed = true; };
-  }, [account.address, isLive]);
+  }, [account.address, isLive, liveRefreshKey]);
 
   useEffect(() => {
     if (!notice) return;
@@ -301,6 +331,7 @@ export function App() {
     await run('deposit', async () => {
       if (isLive) {
         await deposit(account.address, depositAmount);
+        setLiveRefreshKey((current) => current + 1);
       }
       setAccount((current) => ({ ...current, balance: (Number(current.balance) + amount).toFixed(2) }));
       setActivities((current) => [{ id: String(Date.now()), type: 'DEPOSIT', createdAt: '방금 전' }, ...current]);
@@ -320,7 +351,7 @@ export function App() {
     }
 
     const expiresAt = Math.floor(new Date(proposalForm.expiresAt).getTime() / 1000);
-    if (!expiresAt || expiresAt <= Math.floor(Date.now() / 1000)) {
+    if (!isLive && (!expiresAt || expiresAt <= Math.floor(Date.now() / 1000))) {
       setNotice({ type: 'error', text: '유효기간은 현재보다 이후여야 해요.' });
       return;
     }
@@ -360,6 +391,7 @@ export function App() {
       setActivities((current) => [{ id: String(Date.now()), type: 'PROPOSAL_CREATED', createdAt: '방금 전' }, ...current]);
       if (isLive) {
         await saveProposalMetadata(account.address, nextId, proposalForm.purpose, proposalForm.recipientLabel, '', txHash);
+        setLiveRefreshKey((current) => current + 1);
       }
       setNotice({ type: 'success', text: isLive ? 'Proposal이 생성됐어요.' : 'Demo 모드: Proposal이 생성됐어요.' });
       setView('proposal-detail');
@@ -368,7 +400,10 @@ export function App() {
 
   async function handleApprove() {
     await run('approve', async () => {
-      if (isLive) await approveTransaction(account.address, proposal.id);
+      if (isLive) {
+        await approveTransaction(account.address, proposal.id);
+        setLiveRefreshKey((current) => current + 1);
+      }
       const nextSigner = walletAddress || account.owners.find((owner) => !proposal.approvedOwners.includes(owner.address))?.address;
       const approvedOwners = nextSigner && !proposal.approvedOwners.includes(nextSigner)
         ? [...proposal.approvedOwners, nextSigner]
@@ -390,7 +425,10 @@ export function App() {
   async function handleExecute() {
     await run('execute', async () => {
       if (!approvalReady) throw new Error('InsufficientApprovals');
-      if (isLive) await executeTransaction(account.address, proposal.id);
+      if (isLive) {
+        await executeTransaction(account.address, proposal.id);
+        setLiveRefreshKey((current) => current + 1);
+      }
       const nextProposal = { ...proposal, status: 'EXECUTED', executionMatch: 'PASS' } as Proposal;
       setProposal(nextProposal);
       setProposals((current) => current.map((item) => item.id === proposal.id ? nextProposal : item));
@@ -408,7 +446,13 @@ export function App() {
 
     await run('attack', async () => {
       const attacker = '0x9999999999999999999999999999999999999999' as Address;
-      if (isLive) await executeWithPayload(account.address, proposal.id, attacker, proposal.amount);
+      if (isLive) {
+        try {
+          await executeWithPayload(account.address, proposal.id, attacker, proposal.amount);
+        } catch (error) {
+          if (!hasContractError(error, 'IntentMismatch')) throw error;
+        }
+      }
       const nextProposal = { ...proposal, status: 'BLOCKED', executionMatch: 'FAIL' } as Proposal;
       setProposal(nextProposal);
       setProposals((current) => current.map((item) => item.id === proposal.id ? nextProposal : item));
@@ -490,6 +534,7 @@ export function App() {
           <ProposalCreatePage
             account={account}
             form={proposalForm}
+            live={isLive}
             busy={busy}
             onFormChange={(key, value) => setProposalForm((current) => ({ ...current, [key]: value }))}
             onCreate={handleCreateProposal}
@@ -675,15 +720,16 @@ function ConsensusCard({ account, activeProposals, onCreateProposal, onOpenAllPr
   return <div className="threshold-card consensus-card"><div className="card-heading"><span>CONSENSUS</span><span className="live-badge">{activeProposals.length} ACTIVE</span></div>{hasActiveProposal ? <><div className="active-proposal-label">ALL ACTIVE PROPOSALS</div><div className="consensus-proposal-list">{visibleProposals.map((item) => <button className="consensus-proposal-row" key={item.id} onClick={() => onSelectProposal(item.id)}><span className="consensus-proposal-icon">↗</span><span className="consensus-proposal-copy"><b>{item.purpose}</b><small>{item.recipientLabel} · {item.amount} ETH</small></span><span className="consensus-proposal-votes"><b>{item.approvalCount} / {item.threshold}</b><small>동의</small></span><span className={'status-chip ' + item.status.toLowerCase()}>{item.status === 'READY' ? 'READY' : item.status}</span><span className="consensus-proposal-progress">{account.owners.map((owner) => <i key={owner.address} className={item.approvedOwners.includes(owner.address) ? 'approved' : ''} />)}</span></button>)}</div><button className="consensus-view-all" onClick={onOpenAllProposals}>전체보기</button></> : <button className="consensus-empty" onClick={onCreateProposal}><span>＋</span><b>새 지출 제안을 만들어보세요</b><small>클릭해서 Proposal을 작성할 수 있어요.</small></button>}</div>;
 }
 
-function ProposalCreatePage({ account, form, busy, onFormChange, onCreate, onBack }: {
+function ProposalCreatePage({ account, form, live, busy, onFormChange, onCreate, onBack }: {
   account: Account;
   form: { purpose: string; recipient: string; recipientLabel: string; amount: string; expiresAt: string };
+  live: boolean;
   busy: string;
   onFormChange: (key: string, value: string) => void;
   onCreate: (event: FormEvent) => void;
   onBack: () => void;
 }) {
-  return <section className="page narrow-page"><PageHeader eyebrow="NEW PROPOSAL" title="새 지출 제안" description="공동자금을 사용할 거래 조건을 작성해요." onBack={onBack} /><form className="proposal-create-card proposal-create-page-card" onSubmit={onCreate}><div className="proposal-form-heading"><span className="eyebrow">PROPOSAL INTENT</span><span className="step-label">01 / 01</span></div><div className="proposal-form-grid"><label>목적<input value={form.purpose} onChange={(event) => onFormChange('purpose', event.target.value)} placeholder="예: 제주도 숙소" /></label><label>금액<div className="input-suffix"><input value={form.amount} onChange={(event) => onFormChange('amount', event.target.value)} inputMode="decimal" /><span>ETH</span></div></label><label className="wide-field">받는 곳<input value={form.recipient} onChange={(event) => onFormChange('recipient', event.target.value)} placeholder="0x..." /></label><label>표시 이름<input value={form.recipientLabel} onChange={(event) => onFormChange('recipientLabel', event.target.value)} placeholder="예: Hotel A" /></label><label>유효기간<input type="datetime-local" value={form.expiresAt} onChange={(event) => onFormChange('expiresAt', event.target.value)} /></label></div><div className="proposal-form-footer"><span>잔액 {account.balance} ETH · TRANSFER</span><button className="primary-button" type="submit" disabled={busy === 'create-proposal'}>{busy === 'create-proposal' ? '생성 중…' : 'Proposal 만들기 ↗'}</button></div></form></section>;
+  return <section className="page narrow-page"><PageHeader eyebrow="NEW PROPOSAL" title="새 지출 제안" description="공동자금을 사용할 거래 조건을 작성해요." onBack={onBack} /><form className="proposal-create-card proposal-create-page-card" onSubmit={onCreate}><div className="proposal-form-heading"><span className="eyebrow">PROPOSAL INTENT</span><span className="step-label">01 / 01</span></div><div className="proposal-form-grid"><label>목적<input value={form.purpose} onChange={(event) => onFormChange('purpose', event.target.value)} placeholder="예: 제주도 숙소" /></label><label>금액<div className="input-suffix"><input value={form.amount} onChange={(event) => onFormChange('amount', event.target.value)} inputMode="decimal" /><span>ETH</span></div></label><label className="wide-field">받는 곳<input value={form.recipient} onChange={(event) => onFormChange('recipient', event.target.value)} placeholder="0x..." /></label><label>표시 이름<input value={form.recipientLabel} onChange={(event) => onFormChange('recipientLabel', event.target.value)} placeholder="예: Hotel A" /></label>{live ? <label>유효기간<span className="unsupported-field">컨트랙트에서 관리하지 않음</span></label> : <label>유효기간<input type="datetime-local" value={form.expiresAt} onChange={(event) => onFormChange('expiresAt', event.target.value)} /></label>}</div><div className="proposal-form-footer"><span>잔액 {account.balance} ETH · TRANSFER</span><button className="primary-button" type="submit" disabled={busy === 'create-proposal'}>{busy === 'create-proposal' ? '생성 중…' : 'Proposal 만들기 ↗'}</button></div></form></section>;
 }
 
 function ProposalPage({ account, proposal, busy, attackMode, onApprove, onExecute, onAttack, onBack }: {

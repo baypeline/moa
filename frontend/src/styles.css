@@ -148,3 +148,4 @@ h3 { margin: 6px 0 0; font-size: 19px; letter-spacing: -.04em; }
 .deposit-conversion b { margin-left: 4px; color: var(--lime); font-size: 12px; }
 .member-online { display: inline-flex; align-items: center; gap: 6px; }
 .member-online i { width: 6px; height: 6px; display: inline-block; border-radius: 50%; background: var(--lime); box-shadow: 0 0 10px rgba(200, 243, 108, .85); }
+.unsupported-field { display: flex; align-items: center; min-height: 47px; padding: 0 13px; border: 1px dashed var(--line); border-radius: 8px; color: var(--muted); font-size: 11px; }

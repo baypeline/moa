@@ -16,6 +16,18 @@ export type ProposalMetadata = {
   createdAt: string;
 };
 
+async function assertApiResponse(response: Response, fallback: string) {
+  if (response.ok) return;
+  let message = fallback;
+  try {
+    const body = await response.json() as { error?: { message?: string } };
+    message = body.error?.message || message;
+  } catch {
+    // Keep the feature-specific fallback when the server returns a non-JSON error.
+  }
+  throw new Error(message);
+}
+
 export async function getAccountMetadata(address: string) {
   if (!config.backendUrl) return null;
   const response = await fetch(config.backendUrl + '/api/accounts/' + address);
@@ -55,11 +67,12 @@ export async function getProposalMetadataList(address: string): Promise<Proposal
 
 export async function saveAccountMetadata(address: string, name: string, creator: string, txHash: string) {
   if (!config.backendUrl) return;
-  await fetch(config.backendUrl + '/api/accounts', {
+  const response = await fetch(config.backendUrl + '/api/accounts', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ address, name, creator, creationTxHash: txHash }),
   });
+  await assertApiResponse(response, 'Account metadata를 저장하지 못했습니다.');
 }
 
 export async function saveProposalMetadata(
@@ -71,9 +84,10 @@ export async function saveProposalMetadata(
   txHash: string,
 ) {
   if (!config.backendUrl) return;
-  await fetch(config.backendUrl + '/api/accounts/' + address + '/proposals', {
+  const response = await fetch(config.backendUrl + '/api/accounts/' + address + '/proposals', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ proposalId: String(proposalId), purpose, recipientLabel, memo, creationTxHash: txHash }),
   });
+  await assertApiResponse(response, 'Proposal metadata를 저장하지 못했습니다.');
 }
