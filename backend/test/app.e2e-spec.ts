@@ -3,6 +3,8 @@ import { INestApplication } from '@nestjs/common';
 import request from 'supertest';
 import { AppModule } from '../src/app.module';
 import { PrismaService } from '../src/prisma/prisma.service';
+import { BLOCKCHAIN_CLIENT } from '../src/blockchain/blockchain.client';
+import { ContractFunctionRevertedError } from 'viem';
 import { configureApp } from '../src/common/http';
 
 const address = '0x' + 'Ab'.repeat(20);
@@ -28,9 +30,42 @@ function mockPrisma() {
 describe('Moa metadata APIs', () => {
   let app: INestApplication;
   let db: ReturnType<typeof mockPrisma>;
+  let chain: {
+    readContract: jest.Mock;
+    getBalance: jest.Mock;
+    getChainId: jest.Mock;
+  };
   beforeEach(async () => {
     db = mockPrisma();
+    chain = {
+      getChainId: jest.fn().mockResolvedValue(11155111),
+      getBalance: jest.fn().mockResolvedValue(9007199254740993n),
+      readContract: jest.fn().mockImplementation(({ functionName }) =>
+        Promise.resolve(
+          {
+            isMoaAccount: true,
+            accountsOf: [normalized],
+            owners: [normalized],
+            THRESHOLD: 3n,
+            proposalCount: 2n,
+            getProposal: {
+              proposer: normalized,
+              target: normalized,
+              value: 1n,
+              data: '0x',
+              intentHash: txHash.toLowerCase(),
+              approvalCount: 0n,
+              status: 0,
+              createdAt: 1700000000n,
+            },
+            hasApproved: false,
+          }[functionName as string],
+        ),
+      ),
+    };
     const module = await Test.createTestingModule({ imports: [AppModule] })
+      .overrideProvider(BLOCKCHAIN_CLIENT)
+      .useValue({ client: chain, factory: normalized })
       .overrideProvider(PrismaService)
       .useValue(db)
       .compile();
@@ -58,7 +93,7 @@ describe('Moa metadata APIs', () => {
       success: true,
       data: {
         source: 'offchain_metadata',
-        blockchain: { status: 'not_configured' },
+        blockchain: { status: 'configured' },
         metadata: {
           address: normalized,
           creator: normalized,
@@ -94,16 +129,25 @@ describe('Moa metadata APIs', () => {
     });
     await request(app.getHttpServer()).get('/api/accounts').expect(200);
   });
-  it('does not substitute creator for owner and exposes unavailable security', async () => {
+  it('discovers owner accounts without metadata and reads security', async () => {
+    db.accountMetadata.findMany.mockResolvedValue([]);
     const owner = await request(app.getHttpServer())
       .get('/api/accounts')
       .query({ owner: address })
-      .expect(503);
-    expect(owner.body.error.code).toBe('BLOCKCHAIN_NOT_CONFIGURED');
-    expect(db.accountMetadata.findMany).not.toHaveBeenCalled();
-    await request(app.getHttpServer())
+      .expect(200);
+    expect(owner.body.data.items[0]).toMatchObject({
+      address: normalized,
+      metadata: null,
+      state: { balance: '9007199254740993', threshold: '3' },
+    });
+    const security = await request(app.getHttpServer())
       .get(`/api/accounts/${address}/proposals/1/security`)
-      .expect(503);
+      .expect(200);
+    expect(security.body.data).toMatchObject({
+      thresholdReached: false,
+      status: 'Pending',
+    });
+    expect(security.body.data).not.toHaveProperty('executionMatch');
   });
   it('creates and reads proposal metadata with composite key', async () => {
     db.accountMetadata.findUnique.mockResolvedValue({ address: normalized });
@@ -142,6 +186,43 @@ describe('Moa metadata APIs', () => {
     await request(app.getHttpServer())
       .get(`/api/accounts/${address}/proposals`)
       .expect(200);
+  });
+  it('reads proposals without metadata and sanitizes RPC failures', async () => {
+    db.proposalMetadata.findMany.mockResolvedValue([]);
+    const detail = await request(app.getHttpServer())
+      .get(`/api/accounts/${address}/proposals/0`)
+      .expect(200);
+    expect(detail.body.data).toMatchObject({
+      metadata: null,
+      state: {
+        proposalId: '0',
+        status: 'Pending',
+        value: '1',
+        createdAt: '1700000000',
+      },
+    });
+    const list = await request(app.getHttpServer())
+      .get(`/api/accounts/${address}/proposals`)
+      .expect(200);
+    expect(list.body.data.items).toHaveLength(2);
+    expect(list.body.data.items[0]).toMatchObject({
+      proposalId: '0',
+      metadata: null,
+    });
+    chain.getBalance.mockRejectedValue(new Error('internal configuration'));
+    const failure = await request(app.getHttpServer())
+      .get(`/api/accounts/${address}`)
+      .expect(503);
+    expect(failure.body).toEqual({
+      success: false,
+      error: {
+        code: 'BLOCKCHAIN_RPC_FAILED',
+        message: 'Blockchain 상태를 조회하지 못했습니다.',
+      },
+    });
+    await request(app.getHttpServer())
+      .get(`/api/accounts/${address}/proposals/invalid`)
+      .expect(400);
   });
   it('upserts and reads profile', async () => {
     db.walletProfile.upsert.mockResolvedValue({
@@ -196,7 +277,8 @@ describe('Moa metadata APIs', () => {
       .expect(200);
     expect(empty.body.data).toMatchObject({ items: [], nextCursor: null });
   });
-  it('returns metadata not found errors', async () => {
+  it('returns on-chain and profile not found errors', async () => {
+    chain.readContract.mockResolvedValue(false);
     const account = await request(app.getHttpServer())
       .get('/api/accounts/' + address)
       .expect(404);
@@ -207,7 +289,17 @@ describe('Moa metadata APIs', () => {
     await request(app.getHttpServer())
       .get('/api/profiles/' + address)
       .expect(404);
-    db.accountMetadata.findUnique.mockResolvedValue({ address: normalized });
+    chain.readContract.mockImplementation(({ functionName }) => {
+      if (functionName === 'isMoaAccount') return Promise.resolve(true);
+      const error = new ContractFunctionRevertedError({
+        abi: [],
+        functionName: 'getProposal',
+      });
+      Object.defineProperty(error, 'data', {
+        value: { errorName: 'ProposalNotFound' },
+      });
+      return Promise.reject(error);
+    });
     const proposal = await request(app.getHttpServer())
       .get(`/api/accounts/${address}/proposals/1`)
       .expect(404);

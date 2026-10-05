@@ -19,7 +19,10 @@
     "test:cov": "node --experimental-vm-modules ./node_modules/jest/bin/jest.js --coverage",
     "test:debug": "node --inspect-brk --experimental-vm-modules -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
     "test:e2e": "node --experimental-vm-modules ./node_modules/jest/bin/jest.js --config ./test/jest-e2e.json",
-    "prisma:generate": "prisma generate --config prisma7.config.ts"
+    "prisma:generate": "prisma generate --config prisma7.config.ts",
+    "abi:sync": "node scripts/sync-contract-abi.mjs",
+    "abi:check": "node scripts/sync-contract-abi.mjs --check",
+    "test:sepolia": "node scripts/sepolia-smoke.mjs"
   },
   "dependencies": {
     "@nestjs/common": "^12.0.1",
@@ -32,7 +35,8 @@
     "dotenv": "^18.0.5",
     "pg": "^8.23.1",
     "reflect-metadata": "^0.2.2",
-    "rxjs": "^7.8.1"
+    "rxjs": "^7.8.1",
+    "viem": "2.57.2"
   },
   "devDependencies": {
     "@nestjs/cli": "^12.0.0",
