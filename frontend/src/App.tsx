@@ -1,20 +1,25 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
-import { isAddress, type Address } from 'viem';
+import { formatEther, isAddress, type Address } from 'viem';
 import {
   approveTransaction,
   connectWallet,
   createAccount,
+  createProposal,
   deposit,
   executeTransaction,
   executeWithPayload,
   makeIntentHash,
-  proposeTransaction,
+  readAccountState,
+  readApproval,
+  readFactoryAccounts,
+  readProposal,
+  readProposalCount,
 } from './lib/contract';
 import { config, hasAccountAddress, hasFactoryAddress } from './lib/config';
-import { getActivities, getAccountMetadata, type Activity, saveAccountMetadata, saveProposalMetadata } from './lib/api';
+import { getActivities, getAccountMetadata, getProposalMetadataList, type Activity, saveAccountMetadata, saveProposalMetadata } from './lib/api';
 
 type View = 'home' | 'create-account' | 'account' | 'create-proposal' | 'proposal-detail' | 'result';
-type ProposalStatus = 'PENDING' | 'READY' | 'EXECUTED' | 'BLOCKED';
+type ProposalStatus = 'PENDING' | 'READY' | 'EXECUTED' | 'BLOCKED' | 'CANCELLED';
 
 type Owner = {
   address: string;
@@ -36,11 +41,12 @@ type Proposal = {
   recipient: Address;
   recipientLabel: string;
   amount: string;
-  expiresAt: number;
+  expiresAt: number | null;
   status: ProposalStatus;
   approvalCount: number;
   threshold: number;
   intentHash: string;
+  approvedOwners: string[];
   executionMatch: 'PASS' | 'FAIL' | null;
 };
 
@@ -71,6 +77,7 @@ const demoProposal: Proposal = {
   approvalCount: 2,
   threshold: 3,
   intentHash: '0x8c2f…a83f',
+  approvedOwners: [demoOwners[0].address, demoOwners[1].address],
   executionMatch: null,
 };
 
@@ -81,7 +88,8 @@ function shorten(value: string, size = 5) {
   return value.slice(0, size + 2) + '…' + value.slice(-size);
 }
 
-function formatDate(timestamp: number) {
+function formatDate(timestamp: number | null) {
+  if (timestamp === null) return '컨트랙트 미지원';
   return new Intl.DateTimeFormat('ko-KR', {
     month: 'short',
     day: 'numeric',
@@ -108,6 +116,24 @@ function formatError(error: unknown) {
   return message || '요청을 처리하지 못했어요.';
 }
 
+function hasContractError(error: unknown, name: string) {
+  const messages: string[] = [];
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current; depth += 1) {
+    if (current instanceof Error) messages.push(current.message);
+    if (typeof current === 'object' && current !== null && 'shortMessage' in current) {
+      messages.push(String((current as { shortMessage?: unknown }).shortMessage));
+    }
+    if (typeof current === 'object' && current !== null && 'details' in current) {
+      messages.push(String((current as { details?: unknown }).details));
+    }
+    current = typeof current === 'object' && current !== null && 'cause' in current
+      ? (current as { cause?: unknown }).cause
+      : null;
+  }
+  return messages.some((message) => message.includes(name));
+}
+
 export function App() {
   const [view, setView] = useState<View>('home');
   const [walletAddress, setWalletAddress] = useState('');
@@ -126,6 +152,7 @@ export function App() {
   ]);
   const [notice, setNotice] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
   const [busy, setBusy] = useState('');
+  const [liveRefreshKey, setLiveRefreshKey] = useState(0);
   const [depositAmount, setDepositAmount] = useState('0.10');
   const [accountName, setAccountName] = useState('제주도 여행');
   const [ownerInputs, setOwnerInputs] = useState(defaultOwners);
@@ -134,12 +161,12 @@ export function App() {
     recipient: demoProposal.recipient,
     recipientLabel: 'Hotel A',
     amount: '0.32',
-    expiresAt: new Date(demoProposal.expiresAt * 1000).toISOString().slice(0, 16),
+    expiresAt: new Date((demoProposal.expiresAt ?? 0) * 1000).toISOString().slice(0, 16),
   });
 
-  const isLive = Boolean(walletAddress && hasAccountAddress);
+  const isLive = Boolean(walletAddress && (hasAccountAddress || (hasFactoryAddress && account.address !== demoAccount.address)));
   const approvalReady = proposal.approvalCount >= proposal.threshold;
-  const expirationPass = proposal.expiresAt > Math.floor(Date.now() / 1000);
+  const expirationPass = proposal.expiresAt === null ? null : proposal.expiresAt > Math.floor(Date.now() / 1000);
   const currentSecurity = useMemo(() => ({
     threshold: approvalReady,
     intent: true,
@@ -156,6 +183,78 @@ export function App() {
       if (items.length > 0) setActivities(items);
     }).catch(() => undefined);
   }, [account.address]);
+
+  useEffect(() => {
+    if (!walletAddress || !hasFactoryAddress || hasAccountAddress || account.address !== demoAccount.address) return;
+    let disposed = false;
+    void readFactoryAccounts(walletAddress as Address).then((accounts) => {
+      if (disposed || accounts.length === 0) return;
+      setAccount((current) => ({ ...current, address: accounts[accounts.length - 1] }));
+    }).catch(() => undefined);
+    return () => { disposed = true; };
+  }, [walletAddress, account.address]);
+
+  useEffect(() => {
+    if (!isLive) return;
+    let disposed = false;
+    async function syncLiveState() {
+      const [state, proposalCount, metadata] = await Promise.all([
+        readAccountState(account.address),
+        readProposalCount(account.address),
+        getProposalMetadataList(account.address).catch(() => []),
+      ]);
+      const records = await Promise.all(
+        Array.from({ length: Number(proposalCount) }, (_, proposalId) => readProposal(account.address, proposalId)),
+      );
+      const approvals = await Promise.all(
+        records.map((_, proposalId) => Promise.all(state.owners.map((owner) => readApproval(account.address, proposalId, owner)))),
+      );
+      if (disposed) return;
+
+      const metadataById = new Map(metadata.map((item) => [item.proposalId, item]));
+      const nextProposals: Proposal[] = records.map((record, index) => {
+        const proposalId = index;
+        const approvalCount = Number(record.approvalCount);
+        const proposalMetadata = metadataById.get(String(proposalId));
+        const status: ProposalStatus = record.status === 1
+          ? 'EXECUTED'
+          : record.status === 2
+            ? 'CANCELLED'
+            : approvalCount >= state.threshold ? 'READY' : 'PENDING';
+        return {
+          id: proposalId,
+          purpose: proposalMetadata?.purpose || '지출 제안 #' + proposalId,
+          recipient: record.target,
+          recipientLabel: proposalMetadata?.recipientLabel || shorten(record.target),
+          amount: formatEther(record.value),
+          expiresAt: null,
+          status,
+          approvalCount,
+          threshold: state.threshold,
+          intentHash: record.intentHash,
+          approvedOwners: state.owners.filter((_, ownerIndex) => approvals[index][ownerIndex]).map(String),
+          executionMatch: null,
+        };
+      });
+
+      setAccount((current) => ({
+        ...current,
+        balance: state.balance,
+        threshold: state.threshold,
+        owners: state.owners.map((address) => {
+          const existing = current.owners.find((owner) => owner.address.toLowerCase() === address.toLowerCase());
+          return { address, name: existing?.name || shorten(address), approved: false };
+        }),
+      }));
+      setProposals(nextProposals);
+      if (nextProposals.length > 0) {
+        setProposal((current) => nextProposals.find((item) => item.id === current.id) || nextProposals[nextProposals.length - 1]);
+      }
+    }
+
+    void syncLiveState().catch(() => undefined);
+    return () => { disposed = true; };
+  }, [account.address, isLive, liveRefreshKey]);
 
   useEffect(() => {
     if (!notice) return;
@@ -201,7 +300,7 @@ export function App() {
 
     await run('create-account', async () => {
       if (hasFactoryAddress && walletAddress) {
-        const created = await createAccount(validOwners as Address[], 3);
+        const created = await createAccount(validOwners as Address[]);
         await saveAccountMetadata(created.accountAddress, accountName, walletAddress, created.hash);
         setAccount((current) => ({ ...current, address: created.accountAddress }));
         setNotice({ type: 'success', text: '공동계좌 생성 Transaction이 완료됐어요.' });
@@ -232,6 +331,7 @@ export function App() {
     await run('deposit', async () => {
       if (isLive) {
         await deposit(account.address, depositAmount);
+        setLiveRefreshKey((current) => current + 1);
       }
       setAccount((current) => ({ ...current, balance: (Number(current.balance) + amount).toFixed(2) }));
       setActivities((current) => [{ id: String(Date.now()), type: 'DEPOSIT', createdAt: '방금 전' }, ...current]);
@@ -251,25 +351,26 @@ export function App() {
     }
 
     const expiresAt = Math.floor(new Date(proposalForm.expiresAt).getTime() / 1000);
-    if (!expiresAt || expiresAt <= Math.floor(Date.now() / 1000)) {
+    if (!isLive && (!expiresAt || expiresAt <= Math.floor(Date.now() / 1000))) {
       setNotice({ type: 'error', text: '유효기간은 현재보다 이후여야 해요.' });
       return;
     }
 
     await run('create-proposal', async () => {
       let txHash = 'demo';
-      if (isLive) {
-        txHash = await proposeTransaction(account.address, proposalForm.recipient as Address, proposalForm.amount, expiresAt);
-      }
-      const nextId = Math.max(0, ...proposals.map((item) => item.id)) + 1;
-      const intentHash = makeIntentHash(
+      let nextId = Math.max(0, ...proposals.map((item) => item.id)) + 1;
+      let intentHash = makeIntentHash(
         account.address,
         nextId,
         proposalForm.recipient as Address,
         proposalForm.amount,
-        expiresAt,
-        nextId,
       );
+      if (isLive) {
+        const created = await createProposal(account.address, proposalForm.recipient as Address, proposalForm.amount);
+        txHash = created.hash;
+        nextId = created.proposalId;
+        intentHash = created.intentHash;
+      }
 
       const nextProposal: Proposal = {
         id: nextId,
@@ -277,11 +378,12 @@ export function App() {
         recipient: proposalForm.recipient as Address,
         recipientLabel: proposalForm.recipientLabel || shorten(proposalForm.recipient),
         amount: proposalForm.amount,
-        expiresAt,
+        expiresAt: isLive ? null : expiresAt,
         status: 'PENDING',
         approvalCount: 0,
         threshold: 3,
         intentHash,
+        approvedOwners: [],
         executionMatch: null,
       };
       setProposal(nextProposal);
@@ -289,6 +391,7 @@ export function App() {
       setActivities((current) => [{ id: String(Date.now()), type: 'PROPOSAL_CREATED', createdAt: '방금 전' }, ...current]);
       if (isLive) {
         await saveProposalMetadata(account.address, nextId, proposalForm.purpose, proposalForm.recipientLabel, '', txHash);
+        setLiveRefreshKey((current) => current + 1);
       }
       setNotice({ type: 'success', text: isLive ? 'Proposal이 생성됐어요.' : 'Demo 모드: Proposal이 생성됐어요.' });
       setView('proposal-detail');
@@ -297,11 +400,19 @@ export function App() {
 
   async function handleApprove() {
     await run('approve', async () => {
-      if (isLive) await approveTransaction(account.address, proposal.id);
-      const nextCount = Math.min(proposal.threshold, proposal.approvalCount + 1);
+      if (isLive) {
+        await approveTransaction(account.address, proposal.id);
+        setLiveRefreshKey((current) => current + 1);
+      }
+      const nextSigner = walletAddress || account.owners.find((owner) => !proposal.approvedOwners.includes(owner.address))?.address;
+      const approvedOwners = nextSigner && !proposal.approvedOwners.includes(nextSigner)
+        ? [...proposal.approvedOwners, nextSigner]
+        : proposal.approvedOwners;
+      const nextCount = Math.min(proposal.threshold, approvedOwners.length);
       const nextProposal = {
         ...proposal,
         approvalCount: nextCount,
+        approvedOwners,
         status: nextCount >= proposal.threshold ? 'READY' : 'PENDING',
       } as Proposal;
       setProposal(nextProposal);
@@ -314,7 +425,10 @@ export function App() {
   async function handleExecute() {
     await run('execute', async () => {
       if (!approvalReady) throw new Error('InsufficientApprovals');
-      if (isLive) await executeTransaction(account.address, proposal.id);
+      if (isLive) {
+        await executeTransaction(account.address, proposal.id);
+        setLiveRefreshKey((current) => current + 1);
+      }
       const nextProposal = { ...proposal, status: 'EXECUTED', executionMatch: 'PASS' } as Proposal;
       setProposal(nextProposal);
       setProposals((current) => current.map((item) => item.id === proposal.id ? nextProposal : item));
@@ -332,7 +446,13 @@ export function App() {
 
     await run('attack', async () => {
       const attacker = '0x9999999999999999999999999999999999999999' as Address;
-      if (isLive) await executeWithPayload(account.address, proposal.id, attacker, proposal.amount);
+      if (isLive) {
+        try {
+          await executeWithPayload(account.address, proposal.id, attacker, proposal.amount);
+        } catch (error) {
+          if (!hasContractError(error, 'IntentMismatch')) throw error;
+        }
+      }
       const nextProposal = { ...proposal, status: 'BLOCKED', executionMatch: 'FAIL' } as Proposal;
       setProposal(nextProposal);
       setProposals((current) => current.map((item) => item.id === proposal.id ? nextProposal : item));
@@ -414,6 +534,7 @@ export function App() {
           <ProposalCreatePage
             account={account}
             form={proposalForm}
+            live={isLive}
             busy={busy}
             onFormChange={(key, value) => setProposalForm((current) => ({ ...current, [key]: value }))}
             onCreate={handleCreateProposal}
@@ -578,7 +699,7 @@ function AccountPage({ account, proposals, activities, depositAmount, busy, onDe
       </div>
       <div className="content-grid">
         <div className="panel"><div className="panel-heading"><div><span className="eyebrow">MEMBERS</span><h3>함께하는 사람들</h3></div><span className="small-count">5 MEMBERS</span></div><div className="member-list">{account.owners.map((owner) => <div className="member-row" key={owner.address}><span className="avatar">{owner.name.slice(0, 1)}</span><span><b>{owner.name}</b><small>{shorten(owner.address)}</small></span><em className="member-online"><i />ONLINE</em></div>)}</div></div>
-        <div className="panel activity-panel"><div className="panel-heading"><div><span className="eyebrow">ACTIVITY LOG</span><h3>최근 활동</h3></div><span className="small-count">CoC</span></div><div className="timeline">{activities.slice(0, 5).map((activity) => <div className="timeline-row" key={activity.id}><span className="timeline-dot" /><span><b>{activityLabel(activity.type)}</b><small>{activity.actor?.name ? activity.actor.name + ' · ' : ''}{activity.createdAt}</small></span></div>)}</div><button className="consensus-view-all activity-view-all" onClick={onOpenAllActivities}>전체보기</button></div>
+        <div className="panel activity-panel"><div className="panel-heading"><div><span className="eyebrow">ACTIVITY LOG</span><h3>최근 활동</h3></div><span className="small-count">CoC</span></div><div className="timeline">{activities.slice(0, 5).map((activity) => <div className="timeline-row" key={activity.id}><span className="timeline-dot" /><span><b>{activityLabel(activity.type)}</b><small>{activityActorLabel(activity.actor)}{activity.createdAt}</small></span></div>)}</div><button className="consensus-view-all activity-view-all" onClick={onOpenAllActivities}>전체보기</button></div>
       </div>
     </section>
   );
@@ -589,25 +710,26 @@ function ActiveProposalsModal({ proposals, onClose, onSelect }: { proposals: Pro
 }
 
 function ActivityModal({ activities, onClose }: { activities: Activity[]; onClose: () => void }) {
-  return <div className="modal-backdrop" role="presentation" onClick={onClose}><section className="proposal-modal activity-modal" role="dialog" aria-modal="true" aria-labelledby="activity-modal-title" onClick={(event) => event.stopPropagation()}><div className="modal-header"><div><p className="eyebrow">ACTIVITY LOG</p><h2 id="activity-modal-title">전체 활동 내역</h2></div><button className="modal-close" onClick={onClose} aria-label="팝업 닫기">×</button></div>{activities.length === 0 ? <div className="empty-proposals"><span>✓</span><b>아직 활동 내역이 없어요.</b></div> : <div className="activity-modal-list">{activities.map((activity) => <div className="activity-modal-row" key={activity.id}><span className="timeline-dot" /><span><b>{activityLabel(activity.type)}</b><small>{activity.actor?.name ? activity.actor.name + ' · ' : ''}{activity.createdAt}</small></span></div>)}</div>}<button className="modal-secondary" onClick={onClose}>닫기</button></section></div>;
+  return <div className="modal-backdrop" role="presentation" onClick={onClose}><section className="proposal-modal activity-modal" role="dialog" aria-modal="true" aria-labelledby="activity-modal-title" onClick={(event) => event.stopPropagation()}><div className="modal-header"><div><p className="eyebrow">ACTIVITY LOG</p><h2 id="activity-modal-title">전체 활동 내역</h2></div><button className="modal-close" onClick={onClose} aria-label="팝업 닫기">×</button></div>{activities.length === 0 ? <div className="empty-proposals"><span>✓</span><b>아직 활동 내역이 없어요.</b></div> : <div className="activity-modal-list">{activities.map((activity) => <div className="activity-modal-row" key={activity.id}><span className="timeline-dot" /><span><b>{activityLabel(activity.type)}</b><small>{activityActorLabel(activity.actor)}{activity.createdAt}</small></span></div>)}</div>}<button className="modal-secondary" onClick={onClose}>닫기</button></section></div>;
 }
 
 function ConsensusCard({ account, activeProposals, onCreateProposal, onOpenAllProposals, onSelectProposal }: { account: Account; activeProposals: Proposal[]; onCreateProposal: () => void; onOpenAllProposals: () => void; onSelectProposal: (proposalId: number) => void }) {
   const hasActiveProposal = activeProposals.length > 0;
   const visibleProposals = activeProposals.slice(0, 3);
 
-  return <div className="threshold-card consensus-card"><div className="card-heading"><span>CONSENSUS</span><span className="live-badge">{activeProposals.length} ACTIVE</span></div>{hasActiveProposal ? <><div className="active-proposal-label">ALL ACTIVE PROPOSALS</div><div className="consensus-proposal-list">{visibleProposals.map((item) => <button className="consensus-proposal-row" key={item.id} onClick={() => onSelectProposal(item.id)}><span className="consensus-proposal-icon">↗</span><span className="consensus-proposal-copy"><b>{item.purpose}</b><small>{item.recipientLabel} · {item.amount} ETH</small></span><span className="consensus-proposal-votes"><b>{item.approvalCount} / {item.threshold}</b><small>동의</small></span><span className={'status-chip ' + item.status.toLowerCase()}>{item.status === 'READY' ? 'READY' : item.status}</span><span className="consensus-proposal-progress">{account.owners.map((owner, index) => <i key={owner.address} className={index < item.approvalCount ? 'approved' : ''} />)}</span></button>)}</div><button className="consensus-view-all" onClick={onOpenAllProposals}>전체보기</button></> : <button className="consensus-empty" onClick={onCreateProposal}><span>＋</span><b>새 지출 제안을 만들어보세요</b><small>클릭해서 Proposal을 작성할 수 있어요.</small></button>}</div>;
+  return <div className="threshold-card consensus-card"><div className="card-heading"><span>CONSENSUS</span><span className="live-badge">{activeProposals.length} ACTIVE</span></div>{hasActiveProposal ? <><div className="active-proposal-label">ALL ACTIVE PROPOSALS</div><div className="consensus-proposal-list">{visibleProposals.map((item) => <button className="consensus-proposal-row" key={item.id} onClick={() => onSelectProposal(item.id)}><span className="consensus-proposal-icon">↗</span><span className="consensus-proposal-copy"><b>{item.purpose}</b><small>{item.recipientLabel} · {item.amount} ETH</small></span><span className="consensus-proposal-votes"><b>{item.approvalCount} / {item.threshold}</b><small>동의</small></span><span className={'status-chip ' + item.status.toLowerCase()}>{item.status === 'READY' ? 'READY' : item.status}</span><span className="consensus-proposal-progress">{account.owners.map((owner) => <i key={owner.address} className={item.approvedOwners.includes(owner.address) ? 'approved' : ''} />)}</span></button>)}</div><button className="consensus-view-all" onClick={onOpenAllProposals}>전체보기</button></> : <button className="consensus-empty" onClick={onCreateProposal}><span>＋</span><b>새 지출 제안을 만들어보세요</b><small>클릭해서 Proposal을 작성할 수 있어요.</small></button>}</div>;
 }
 
-function ProposalCreatePage({ account, form, busy, onFormChange, onCreate, onBack }: {
+function ProposalCreatePage({ account, form, live, busy, onFormChange, onCreate, onBack }: {
   account: Account;
   form: { purpose: string; recipient: string; recipientLabel: string; amount: string; expiresAt: string };
+  live: boolean;
   busy: string;
   onFormChange: (key: string, value: string) => void;
   onCreate: (event: FormEvent) => void;
   onBack: () => void;
 }) {
-  return <section className="page narrow-page"><PageHeader eyebrow="NEW PROPOSAL" title="새 지출 제안" description="공동자금을 사용할 거래 조건을 작성해요." onBack={onBack} /><form className="proposal-create-card proposal-create-page-card" onSubmit={onCreate}><div className="proposal-form-heading"><span className="eyebrow">PROPOSAL INTENT</span><span className="step-label">01 / 01</span></div><div className="proposal-form-grid"><label>목적<input value={form.purpose} onChange={(event) => onFormChange('purpose', event.target.value)} placeholder="예: 제주도 숙소" /></label><label>금액<div className="input-suffix"><input value={form.amount} onChange={(event) => onFormChange('amount', event.target.value)} inputMode="decimal" /><span>ETH</span></div></label><label className="wide-field">받는 곳<input value={form.recipient} onChange={(event) => onFormChange('recipient', event.target.value)} placeholder="0x..." /></label><label>표시 이름<input value={form.recipientLabel} onChange={(event) => onFormChange('recipientLabel', event.target.value)} placeholder="예: Hotel A" /></label><label>유효기간<input type="datetime-local" value={form.expiresAt} onChange={(event) => onFormChange('expiresAt', event.target.value)} /></label></div><div className="proposal-form-footer"><span>잔액 {account.balance} ETH · TRANSFER</span><button className="primary-button" type="submit" disabled={busy === 'create-proposal'}>{busy === 'create-proposal' ? '생성 중…' : 'Proposal 만들기 ↗'}</button></div></form></section>;
+  return <section className="page narrow-page"><PageHeader eyebrow="NEW PROPOSAL" title="새 지출 제안" description="공동자금을 사용할 거래 조건을 작성해요." onBack={onBack} /><form className="proposal-create-card proposal-create-page-card" onSubmit={onCreate}><div className="proposal-form-heading"><span className="eyebrow">PROPOSAL INTENT</span><span className="step-label">01 / 01</span></div><div className="proposal-form-grid"><label>목적<input value={form.purpose} onChange={(event) => onFormChange('purpose', event.target.value)} placeholder="예: 제주도 숙소" /></label><label>금액<div className="input-suffix"><input value={form.amount} onChange={(event) => onFormChange('amount', event.target.value)} inputMode="decimal" /><span>ETH</span></div></label><label className="wide-field">받는 곳<input value={form.recipient} onChange={(event) => onFormChange('recipient', event.target.value)} placeholder="0x..." /></label><label>표시 이름<input value={form.recipientLabel} onChange={(event) => onFormChange('recipientLabel', event.target.value)} placeholder="예: Hotel A" /></label>{live ? <label>유효기간<span className="unsupported-field">컨트랙트에서 관리하지 않음</span></label> : <label>유효기간<input type="datetime-local" value={form.expiresAt} onChange={(event) => onFormChange('expiresAt', event.target.value)} /></label>}</div><div className="proposal-form-footer"><span>잔액 {account.balance} ETH · TRANSFER</span><button className="primary-button" type="submit" disabled={busy === 'create-proposal'}>{busy === 'create-proposal' ? '생성 중…' : 'Proposal 만들기 ↗'}</button></div></form></section>;
 }
 
 function ProposalPage({ account, proposal, busy, attackMode, onApprove, onExecute, onAttack, onBack }: {
@@ -633,11 +755,11 @@ function ProposalPage({ account, proposal, busy, attackMode, onApprove, onExecut
           <div className="recipient-block"><span>RECIPIENT</span><b>{proposal.recipientLabel}</b><code>{shorten(proposal.recipient, 8)}</code></div>
           <div className="proposal-meta-row"><span><small>EXPIRES</small><b>{formatDate(proposal.expiresAt)}</b></span><span><small>ACTION</small><b>TRANSFER</b></span><span><small>INTENT HASH</small><b>{proposal.intentHash}</b></span></div>
           <div className="approval-progress"><div className="progress-label"><span>구성원 승인</span><b>{proposal.approvalCount} / {proposal.threshold}</b></div><div className="progress-track"><i style={{ width: Math.min(100, proposal.approvalCount / proposal.threshold * 100) + '%' }} /></div></div>
-          <div className="approval-avatars">{account.owners.map((owner, index) => <span className={index < proposal.approvalCount ? 'approved' : ''} key={owner.address}>{owner.name.slice(0, 1)}</span>)}</div>
+          <div className="approval-avatars">{account.owners.map((owner) => <span className={proposal.approvedOwners.includes(owner.address) ? 'approved' : ''} key={owner.address}>{owner.name.slice(0, 1)}</span>)}</div>
           {!isResult && <div className="action-row"><button className="secondary-button" onClick={onApprove} disabled={busy === 'approve' || ready}>{busy === 'approve' ? '서명 중…' : ready ? '동의 완료 ✓' : '동의하기'}</button><button className="primary-button" onClick={onExecute} disabled={!ready || busy === 'execute'}>{busy === 'execute' ? '실행 중…' : '실행하기 ↗'}</button></div>}
         </div>
 
-        <div className="security-card"><div className="card-heading"><span>SECURITY LAYER</span><span className="lock-icon">⌁</span></div><p className="security-lead">서명은 충분했지만,<br /><b>합의한 거래인지 다시 확인해요.</b></p><SecurityRow label="Threshold" status={proposal.approvalCount >= proposal.threshold ? 'PASS' : 'WAIT'} value={proposal.approvalCount + ' / ' + proposal.threshold} /><SecurityRow label="Intent" status="PASS" value={shorten(proposal.intentHash, 7)} /><SecurityRow label="Expiration" status={proposal.expiresAt > Math.floor(Date.now() / 1000) ? 'PASS' : 'FAIL'} value={formatDate(proposal.expiresAt)} /><SecurityRow label="Execution Match" status={proposal.executionMatch || 'WAIT'} value={proposal.executionMatch === 'FAIL' ? 'Recipient mismatch' : proposal.executionMatch === 'PASS' ? 'All fields match' : '검증 대기'} />{attackMode && !isResult && ready && <button className="attack-button" onClick={onAttack} disabled={busy === 'attack'}><span>⚠</span>{busy === 'attack' ? '공격 시뮬레이션 중…' : 'Attack Path 실행'}</button>}</div>
+        <div className="security-card"><div className="card-heading"><span>SECURITY LAYER</span><span className="lock-icon">⌁</span></div><p className="security-lead">서명은 충분했지만,<br /><b>합의한 거래인지 다시 확인해요.</b></p><SecurityRow label="Threshold" status={proposal.approvalCount >= proposal.threshold ? 'PASS' : 'WAIT'} value={proposal.approvalCount + ' / ' + proposal.threshold} /><SecurityRow label="Intent" status="PASS" value={shorten(proposal.intentHash, 7)} /><SecurityRow label="Expiration" status={proposal.expiresAt === null ? 'WAIT' : proposal.expiresAt > Math.floor(Date.now() / 1000) ? 'PASS' : 'FAIL'} value={formatDate(proposal.expiresAt)} /><SecurityRow label="Execution Match" status={proposal.executionMatch || 'WAIT'} value={proposal.executionMatch === 'FAIL' ? 'Recipient mismatch' : proposal.executionMatch === 'PASS' ? 'All fields match' : '검증 대기'} />{attackMode && !isResult && ready && <button className="attack-button" onClick={onAttack} disabled={busy === 'attack'}><span>⚠</span>{busy === 'attack' ? '공격 시뮬레이션 중…' : 'Attack Path 실행'}</button>}</div>
       </div>
     </section>
   );
@@ -645,12 +767,12 @@ function ProposalPage({ account, proposal, busy, attackMode, onApprove, onExecut
 
 function ResultPage({ proposal, security, onBack, onHome }: {
   proposal: Proposal;
-  security: { threshold: boolean; intent: boolean; expiration: boolean; executionMatch: 'PASS' | 'FAIL' | null };
+  security: { threshold: boolean; intent: boolean; expiration: boolean | null; executionMatch: 'PASS' | 'FAIL' | null };
   onBack: () => void;
   onHome: () => void;
 }) {
   const blocked = proposal.status === 'BLOCKED';
-  return <section className="page result-page"><div className={'result-icon ' + (blocked ? 'blocked' : 'success')}>{blocked ? '!' : '✓'}</div><p className="eyebrow">{blocked ? 'EXECUTION BLOCKED' : 'TRANSACTION EXECUTED'}</p><h1>{blocked ? '실행이 차단됐어요.' : '지출이 완료됐어요.'}</h1><p className="result-description">{blocked ? '승인한 내용과 실제 실행 요청이 일치하지 않습니다.' : '모든 구성원이 합의한 내용으로 자산이 이동했습니다.'}</p>{blocked && <div className="mismatch-card"><div><span>승인한 대상</span><b>{proposal.recipientLabel}</b><code>{shorten(proposal.recipient)}</code></div><span className="mismatch-arrow">≠</span><div><span>실제 요청</span><b>Unknown</b><code>0x9999…9999</code></div></div>}<div className="result-checks"><SecurityRow label="Threshold" status={security.threshold ? 'PASS' : 'FAIL'} value={proposal.approvalCount + ' / ' + proposal.threshold} /><SecurityRow label="Intent" status={security.intent ? 'PASS' : 'FAIL'} value="승인된 Intent" /><SecurityRow label="Expiration" status={security.expiration ? 'PASS' : 'FAIL'} value={security.expiration ? '유효함' : '만료됨'} /><SecurityRow label="Execution Match" status={security.executionMatch || 'WAIT'} value={blocked ? 'Recipient mismatch' : 'All fields match'} /></div><div className="result-actions"><button className="secondary-button" onClick={onBack}>Proposal로 돌아가기</button><button className="primary-button" onClick={onHome}>Home으로 이동 ↗</button></div></section>;
+  return <section className="page result-page"><div className={'result-icon ' + (blocked ? 'blocked' : 'success')}>{blocked ? '!' : '✓'}</div><p className="eyebrow">{blocked ? 'EXECUTION BLOCKED' : 'TRANSACTION EXECUTED'}</p><h1>{blocked ? '실행이 차단됐어요.' : '지출이 완료됐어요.'}</h1><p className="result-description">{blocked ? '승인한 내용과 실제 실행 요청이 일치하지 않습니다.' : '모든 구성원이 합의한 내용으로 자산이 이동했습니다.'}</p>{blocked && <div className="mismatch-card"><div><span>승인한 대상</span><b>{proposal.recipientLabel}</b><code>{shorten(proposal.recipient)}</code></div><span className="mismatch-arrow">≠</span><div><span>실제 요청</span><b>Unknown</b><code>0x9999…9999</code></div></div>}<div className="result-checks"><SecurityRow label="Threshold" status={security.threshold ? 'PASS' : 'FAIL'} value={proposal.approvalCount + ' / ' + proposal.threshold} /><SecurityRow label="Intent" status={security.intent ? 'PASS' : 'FAIL'} value="승인된 Intent" /><SecurityRow label="Expiration" status={security.expiration === null ? 'WAIT' : security.expiration ? 'PASS' : 'FAIL'} value={security.expiration === null ? '컨트랙트 미지원' : security.expiration ? '유효함' : '만료됨'} /><SecurityRow label="Execution Match" status={security.executionMatch || 'WAIT'} value={blocked ? 'Recipient mismatch' : 'All fields match'} /></div><div className="result-actions"><button className="secondary-button" onClick={onBack}>Proposal로 돌아가기</button><button className="primary-button" onClick={onHome}>Home으로 이동 ↗</button></div></section>;
 }
 
 function SecurityRow({ label, status, value }: { label: string; status: string; value: string }) {
@@ -673,4 +795,9 @@ function activityLabel(type: string) {
     PROPOSAL_EXECUTED: '지출 실행 완료',
   };
   return labels[type] || type;
+}
+
+function activityActorLabel(actor?: Activity['actor']) {
+  if (!actor) return '';
+  return (actor.name || shorten(actor.address)) + ' · ';
 }

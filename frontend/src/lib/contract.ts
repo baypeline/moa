@@ -5,7 +5,9 @@ import {
   encodeAbiParameters,
   http,
   keccak256,
+  parseEventLogs,
   parseEther,
+  formatEther,
   type Address,
   type Hex,
   type PublicClient,
@@ -26,28 +28,104 @@ const localChain = {
 
 export const factoryAbi = [
   {
+    type: 'error',
+    name: 'CreatorNotOwner',
+    inputs: [{ name: 'creator', type: 'address' }],
+  },
+  {
     type: 'function',
     name: 'createAccount',
     stateMutability: 'nonpayable',
     inputs: [
-      { name: 'owners', type: 'address[]' },
-      { name: 'threshold', type: 'uint256' },
+      { name: 'owners', type: 'address[5]' },
     ],
     outputs: [{ name: 'account', type: 'address' }],
+  },
+  {
+    type: 'function',
+    name: 'accountsOf',
+    stateMutability: 'view',
+    inputs: [{ name: 'owner', type: 'address' }],
+    outputs: [{ name: '', type: 'address[]' }],
+  },
+  {
+    type: 'event',
+    name: 'AccountCreated',
+    inputs: [
+      { name: 'account', type: 'address', indexed: true },
+      { name: 'creator', type: 'address', indexed: true },
+      { name: 'owners', type: 'address[5]', indexed: false },
+      { name: 'threshold', type: 'uint256', indexed: false },
+    ],
   },
 ] as const;
 
 export const accountAbi = [
   {
-    type: 'function',
-    name: 'getOwners',
-    stateMutability: 'view',
-    inputs: [],
-    outputs: [{ name: '', type: 'address[]' }],
+    type: 'error',
+    name: 'NotOwner',
+    inputs: [{ name: 'caller', type: 'address' }],
+  },
+  {
+    type: 'error',
+    name: 'ProposalNotFound',
+    inputs: [{ name: 'proposalId', type: 'uint256' }],
+  },
+  {
+    type: 'error',
+    name: 'ProposalNotPending',
+    inputs: [{ name: 'proposalId', type: 'uint256' }],
+  },
+  {
+    type: 'error',
+    name: 'AlreadyApproved',
+    inputs: [
+      { name: 'proposalId', type: 'uint256' },
+      { name: 'owner', type: 'address' },
+    ],
+  },
+  {
+    type: 'error',
+    name: 'InsufficientApprovals',
+    inputs: [
+      { name: 'proposalId', type: 'uint256' },
+      { name: 'current', type: 'uint256' },
+      { name: 'required', type: 'uint256' },
+    ],
+  },
+  {
+    type: 'error',
+    name: 'IntentMismatch',
+    inputs: [
+      { name: 'expected', type: 'bytes32' },
+      { name: 'actual', type: 'bytes32' },
+    ],
+  },
+  {
+    type: 'error',
+    name: 'InsufficientBalance',
+    inputs: [
+      { name: 'available', type: 'uint256' },
+      { name: 'required', type: 'uint256' },
+    ],
   },
   {
     type: 'function',
-    name: 'threshold',
+    name: 'owners',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ name: '', type: 'address[5]' }],
+  },
+  {
+    type: 'function',
+    name: 'THRESHOLD',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ name: '', type: 'uint256' }],
+  },
+  {
+    type: 'function',
+    name: 'proposalCount',
     stateMutability: 'view',
     inputs: [],
     outputs: [{ name: '', type: 'uint256' }],
@@ -57,16 +135,20 @@ export const accountAbi = [
     name: 'getProposal',
     stateMutability: 'view',
     inputs: [{ name: 'proposalId', type: 'uint256' }],
-    outputs: [
-      { name: 'proposer', type: 'address' },
-      { name: 'recipient', type: 'address' },
-      { name: 'amount', type: 'uint256' },
-      { name: 'action', type: 'uint8' },
-      { name: 'expiresAt', type: 'uint256' },
-      { name: 'intentHash', type: 'bytes32' },
-      { name: 'approvalCount', type: 'uint256' },
-      { name: 'executed', type: 'bool' },
-    ],
+    outputs: [{
+      name: '',
+      type: 'tuple',
+      components: [
+        { name: 'proposer', type: 'address' },
+        { name: 'target', type: 'address' },
+        { name: 'value', type: 'uint256' },
+        { name: 'data', type: 'bytes' },
+        { name: 'intentHash', type: 'bytes32' },
+        { name: 'approvalCount', type: 'uint256' },
+        { name: 'status', type: 'uint8' },
+        { name: 'createdAt', type: 'uint256' },
+      ],
+    }],
   },
   {
     type: 'function',
@@ -80,50 +162,109 @@ export const accountAbi = [
   },
   {
     type: 'function',
-    name: 'canExecute',
+    name: 'computeIntentHash',
     stateMutability: 'view',
-    inputs: [{ name: 'proposalId', type: 'uint256' }],
-    outputs: [{ name: '', type: 'bool' }],
+    inputs: [
+      { name: 'proposalId', type: 'uint256' },
+      { name: 'target', type: 'address' },
+      { name: 'value', type: 'uint256' },
+      { name: 'data', type: 'bytes' },
+    ],
+    outputs: [{ name: '', type: 'bytes32' }],
   },
   {
     type: 'function',
-    name: 'proposeTransaction',
+    name: 'createProposal',
     stateMutability: 'nonpayable',
     inputs: [
-      { name: 'recipient', type: 'address' },
-      { name: 'amount', type: 'uint256' },
-      { name: 'action', type: 'uint8' },
-      { name: 'expiresAt', type: 'uint256' },
+      { name: 'target', type: 'address' },
+      { name: 'value', type: 'uint256' },
+      { name: 'data', type: 'bytes' },
     ],
     outputs: [{ name: 'proposalId', type: 'uint256' }],
   },
   {
     type: 'function',
-    name: 'approveTransaction',
+    name: 'approveProposal',
     stateMutability: 'nonpayable',
     inputs: [{ name: 'proposalId', type: 'uint256' }],
     outputs: [],
   },
   {
     type: 'function',
-    name: 'executeTransaction',
-    stateMutability: 'nonpayable',
-    inputs: [{ name: 'proposalId', type: 'uint256' }],
-    outputs: [],
-  },
-  {
-    type: 'function',
-    name: 'executeWithPayload',
+    name: 'executeProposal',
     stateMutability: 'nonpayable',
     inputs: [
       { name: 'proposalId', type: 'uint256' },
-      { name: 'recipient', type: 'address' },
-      { name: 'amount', type: 'uint256' },
-      { name: 'action', type: 'uint8' },
+      { name: 'target', type: 'address' },
+      { name: 'value', type: 'uint256' },
+      { name: 'data', type: 'bytes' },
     ],
     outputs: [],
   },
+  {
+    type: 'function',
+    name: 'cancelProposal',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'proposalId', type: 'uint256' },
+    ],
+    outputs: [],
+  },
+  {
+    type: 'event',
+    name: 'Deposited',
+    inputs: [
+      { name: 'sender', type: 'address', indexed: true },
+      { name: 'amount', type: 'uint256', indexed: false },
+      { name: 'balance', type: 'uint256', indexed: false },
+    ],
+  },
+  {
+    type: 'event',
+    name: 'ProposalCreated',
+    inputs: [
+      { name: 'proposalId', type: 'uint256', indexed: true },
+      { name: 'proposer', type: 'address', indexed: true },
+      { name: 'target', type: 'address', indexed: true },
+      { name: 'value', type: 'uint256', indexed: false },
+      { name: 'data', type: 'bytes', indexed: false },
+      { name: 'intentHash', type: 'bytes32', indexed: false },
+    ],
+  },
+  {
+    type: 'event',
+    name: 'ProposalApproved',
+    inputs: [
+      { name: 'proposalId', type: 'uint256', indexed: true },
+      { name: 'owner', type: 'address', indexed: true },
+      { name: 'approvalCount', type: 'uint256', indexed: false },
+    ],
+  },
+  {
+    type: 'event',
+    name: 'ProposalExecuted',
+    inputs: [
+      { name: 'proposalId', type: 'uint256', indexed: true },
+      { name: 'executor', type: 'address', indexed: true },
+      { name: 'target', type: 'address', indexed: true },
+      { name: 'value', type: 'uint256', indexed: false },
+      { name: 'data', type: 'bytes', indexed: false },
+      { name: 'intentHash', type: 'bytes32', indexed: false },
+    ],
+  },
 ] as const;
+
+type OnchainProposal = {
+  proposer: Address;
+  target: Address;
+  value: bigint;
+  data: Hex;
+  intentHash: Hex;
+  approvalCount: bigint;
+  status: number;
+  createdAt: bigint;
+};
 
 export const publicClient = createPublicClient({
   chain: localChain,
@@ -135,21 +276,30 @@ export async function readAccountState(accountAddress: Address) {
     publicClient.readContract({
       address: accountAddress,
       abi: accountAbi,
-      functionName: 'getOwners',
+      functionName: 'owners',
     }),
     publicClient.readContract({
       address: accountAddress,
       abi: accountAbi,
-      functionName: 'threshold',
+      functionName: 'THRESHOLD',
     }),
     publicClient.getBalance({ address: accountAddress }),
   ]);
 
   return {
-    owners,
+    owners: Array.from(owners),
     threshold: Number(threshold),
-    balance,
+    balance: formatEther(balance),
   };
+}
+
+export async function readFactoryAccounts(owner: Address) {
+  return publicClient.readContract({
+    address: config.factoryAddress,
+    abi: factoryAbi,
+    functionName: 'accountsOf',
+    args: [owner],
+  });
 }
 
 export async function readProposal(accountAddress: Address, proposalId: number) {
@@ -158,6 +308,14 @@ export async function readProposal(accountAddress: Address, proposalId: number) 
     abi: accountAbi,
     functionName: 'getProposal',
     args: [BigInt(proposalId)],
+  }) as Promise<OnchainProposal>;
+}
+
+export async function readProposalCount(accountAddress: Address) {
+  return publicClient.readContract({
+    address: accountAddress,
+    abi: accountAbi,
+    functionName: 'proposalCount',
   });
 }
 
@@ -171,12 +329,11 @@ export async function readApproval(accountAddress: Address, proposalId: number, 
 }
 
 export async function readCanExecute(accountAddress: Address, proposalId: number) {
-  return publicClient.readContract({
-    address: accountAddress,
-    abi: accountAbi,
-    functionName: 'canExecute',
-    args: [BigInt(proposalId)],
-  });
+  const [proposal, balance] = await Promise.all([
+    readProposal(accountAddress, proposalId),
+    publicClient.getBalance({ address: accountAddress }),
+  ]);
+  return proposal.status === 0 && proposal.approvalCount >= 3n && balance >= proposal.value;
 }
 
 export function getWalletClient() {
@@ -190,9 +347,22 @@ export function getWalletClient() {
   });
 }
 
+async function getSupportedWalletClient() {
+  const walletClient = getWalletClient();
+  const chainId = await walletClient.getChainId();
+  if (chainId !== config.chainId) {
+    throw new Error(`지원 네트워크가 아닙니다. 지갑 네트워크를 Chain ID ${config.chainId}로 변경해주세요.`);
+  }
+  return walletClient;
+}
+
 export async function connectWallet() {
   const walletClient = getWalletClient();
   const [address] = await walletClient.requestAddresses();
+  const chainId = await walletClient.getChainId();
+  if (chainId !== config.chainId) {
+    throw new Error(`지원 네트워크가 아닙니다. 지갑 네트워크를 Chain ID ${config.chainId}로 변경해주세요.`);
+  }
   return address;
 }
 
@@ -201,23 +371,27 @@ async function waitForTransaction(client: WalletClient, hash: Hex) {
   return hash;
 }
 
-export async function createAccount(owners: Address[], threshold = 3) {
-  const walletClient = getWalletClient();
+export async function createAccount(owners: Address[]) {
+  if (owners.length !== 5) throw new Error('공동계좌에는 Owner 5명이 필요합니다.');
+  const walletClient = await getSupportedWalletClient();
   const [account] = await walletClient.getAddresses();
-  const { request, result } = await publicClient.simulateContract({
+  const { request } = await publicClient.simulateContract({
     address: config.factoryAddress,
     abi: factoryAbi,
     functionName: 'createAccount',
-    args: [owners, BigInt(threshold)],
+    args: [owners as [Address, Address, Address, Address, Address]],
     account,
   });
   const hash = await walletClient.writeContract(request);
-  await waitForTransaction(walletClient, hash);
-  return { hash, accountAddress: result as Address };
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  const logs = parseEventLogs({ abi: factoryAbi, logs: receipt.logs, eventName: 'AccountCreated' });
+  const log = logs[0];
+  if (!log) throw new Error('AccountCreated 이벤트를 찾지 못했습니다.');
+  return { hash, accountAddress: log.args.account };
 }
 
 export async function deposit(accountAddress: Address, amount: string) {
-  const walletClient = getWalletClient();
+  const walletClient = await getSupportedWalletClient();
   const [account] = await walletClient.getAddresses();
   const hash = await walletClient.sendTransaction({
     account,
@@ -227,31 +401,34 @@ export async function deposit(accountAddress: Address, amount: string) {
   return waitForTransaction(walletClient, hash);
 }
 
-export async function proposeTransaction(
+export async function createProposal(
   accountAddress: Address,
   recipient: Address,
   amount: string,
-  expiresAt: number,
 ) {
-  const walletClient = getWalletClient();
+  const walletClient = await getSupportedWalletClient();
   const [account] = await walletClient.getAddresses();
   const hash = await walletClient.writeContract({
     address: accountAddress,
     abi: accountAbi,
-    functionName: 'proposeTransaction',
-    args: [recipient, parseEther(amount), ACTION_TRANSFER, BigInt(expiresAt)],
+    functionName: 'createProposal',
+    args: [recipient, parseEther(amount), '0x'],
     account,
   });
-  return waitForTransaction(walletClient, hash);
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  const logs = parseEventLogs({ abi: accountAbi, logs: receipt.logs, eventName: 'ProposalCreated' });
+  const log = logs[0];
+  if (!log) throw new Error('ProposalCreated 이벤트를 찾지 못했습니다.');
+  return { hash, proposalId: Number(log.args.proposalId), intentHash: log.args.intentHash };
 }
 
 export async function approveTransaction(accountAddress: Address, proposalId: number) {
-  const walletClient = getWalletClient();
+  const walletClient = await getSupportedWalletClient();
   const [account] = await walletClient.getAddresses();
   const hash = await walletClient.writeContract({
     address: accountAddress,
     abi: accountAbi,
-    functionName: 'approveTransaction',
+    functionName: 'approveProposal',
     args: [BigInt(proposalId)],
     account,
   });
@@ -259,13 +436,14 @@ export async function approveTransaction(accountAddress: Address, proposalId: nu
 }
 
 export async function executeTransaction(accountAddress: Address, proposalId: number) {
-  const walletClient = getWalletClient();
+  const walletClient = await getSupportedWalletClient();
   const [account] = await walletClient.getAddresses();
+  const proposal = await readProposal(accountAddress, proposalId);
   const hash = await walletClient.writeContract({
     address: accountAddress,
     abi: accountAbi,
-    functionName: 'executeTransaction',
-    args: [BigInt(proposalId)],
+    functionName: 'executeProposal',
+    args: [BigInt(proposalId), proposal.target, proposal.value, proposal.data],
     account,
   });
   return waitForTransaction(walletClient, hash);
@@ -277,13 +455,13 @@ export async function executeWithPayload(
   recipient: Address,
   amount: string,
 ) {
-  const walletClient = getWalletClient();
+  const walletClient = await getSupportedWalletClient();
   const [account] = await walletClient.getAddresses();
   const hash = await walletClient.writeContract({
     address: accountAddress,
     abi: accountAbi,
-    functionName: 'executeWithPayload',
-    args: [BigInt(proposalId), recipient, parseEther(amount), ACTION_TRANSFER],
+    functionName: 'executeProposal',
+    args: [BigInt(proposalId), recipient, parseEther(amount), '0x'],
     account,
   });
   return waitForTransaction(walletClient, hash);
@@ -294,30 +472,25 @@ export function makeIntentHash(
   proposalId: number,
   recipient: Address,
   amount: string,
-  expiresAt: number,
-  nonce: number,
+  data: Hex = '0x',
 ) {
   return keccak256(
     encodeAbiParameters(
       [
         { type: 'address' },
         { type: 'uint256' },
+        { type: 'uint256' },
         { type: 'address' },
         { type: 'uint256' },
-        { type: 'uint8' },
-        { type: 'uint256' },
-        { type: 'uint256' },
-        { type: 'uint256' },
+        { type: 'bytes32' },
       ],
       [
         accountAddress,
+        BigInt(config.chainId),
         BigInt(proposalId),
         recipient,
         parseEther(amount),
-        ACTION_TRANSFER,
-        BigInt(expiresAt),
-        BigInt(nonce),
-        BigInt(config.chainId),
+        keccak256(data),
       ],
     ),
   );
