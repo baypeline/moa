@@ -16,6 +16,13 @@ export type ProposalMetadata = {
   createdAt: string;
 };
 
+export type WalletProfile = {
+  address: string;
+  name: string;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
 async function assertApiResponse(response: Response, fallback: string) {
   if (response.ok) return;
   let message = fallback;
@@ -90,4 +97,25 @@ export async function saveProposalMetadata(
     body: JSON.stringify({ proposalId: String(proposalId), purpose, recipientLabel, memo, creationTxHash: txHash }),
   });
   await assertApiResponse(response, 'Proposal metadata를 저장하지 못했습니다.');
+}
+
+export async function getWalletProfile(address: string): Promise<WalletProfile | null> {
+  if (!config.backendUrl) return null;
+  const response = await fetch(config.backendUrl + '/api/profiles/' + address);
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error('Wallet Profile을 불러오지 못했습니다.');
+  const body = await response.json();
+  return body.data ?? null;
+}
+
+export async function saveWalletProfile(address: string, name: string) {
+  if (!config.backendUrl) return null;
+  const response = await fetch(config.backendUrl + '/api/profiles/' + address, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  });
+  await assertApiResponse(response, 'Wallet Profile을 저장하지 못했습니다.');
+  const body = await response.json();
+  return body.data as WalletProfile;
 }

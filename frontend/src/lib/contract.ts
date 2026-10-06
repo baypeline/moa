@@ -24,6 +24,11 @@ const localChain = {
   rpcUrls: {
     default: { http: [config.rpcUrl] },
   },
+  contracts: {
+    multicall3: {
+      address: '0xca11bde05977b3631167028862be2a173976ca11' as Address,
+    },
+  },
 } as const;
 
 export const factoryAbi = [
@@ -107,6 +112,14 @@ export const accountAbi = [
     inputs: [
       { name: 'available', type: 'uint256' },
       { name: 'required', type: 'uint256' },
+    ],
+  },
+  {
+    type: 'error',
+    name: 'NotProposer',
+    inputs: [
+      { name: 'proposalId', type: 'uint256' },
+      { name: 'caller', type: 'address' },
     ],
   },
   {
@@ -273,22 +286,19 @@ export const publicClient = createPublicClient({
 
 export async function readAccountState(accountAddress: Address) {
   const [owners, threshold, balance] = await Promise.all([
-    publicClient.readContract({
-      address: accountAddress,
-      abi: accountAbi,
-      functionName: 'owners',
-    }),
-    publicClient.readContract({
-      address: accountAddress,
-      abi: accountAbi,
-      functionName: 'THRESHOLD',
+    publicClient.multicall({
+      contracts: [
+        { address: accountAddress, abi: accountAbi, functionName: 'owners' },
+        { address: accountAddress, abi: accountAbi, functionName: 'THRESHOLD' },
+      ],
+      allowFailure: false,
     }),
     publicClient.getBalance({ address: accountAddress }),
-  ]);
+  ]).then(([results, nextBalance]) => [results[0], results[1], nextBalance] as const);
 
   return {
-    owners: Array.from(owners),
-    threshold: Number(threshold),
+    owners: Array.from(owners as readonly Address[]),
+    threshold: Number(threshold as bigint),
     balance: formatEther(balance),
   };
 }
@@ -319,6 +329,20 @@ export async function readProposalCount(accountAddress: Address) {
   });
 }
 
+export async function readProposalBatch(accountAddress: Address, proposalIds: number[]) {
+  if (proposalIds.length === 0) return [] as OnchainProposal[];
+  const results = await publicClient.multicall({
+    contracts: proposalIds.map((proposalId) => ({
+      address: accountAddress,
+      abi: accountAbi,
+      functionName: 'getProposal' as const,
+      args: [BigInt(proposalId)] as const,
+    })),
+    allowFailure: false,
+  });
+  return results as OnchainProposal[];
+}
+
 export async function readApproval(accountAddress: Address, proposalId: number, owner: Address) {
   return publicClient.readContract({
     address: accountAddress,
@@ -326,6 +350,20 @@ export async function readApproval(accountAddress: Address, proposalId: number, 
     functionName: 'hasApproved',
     args: [BigInt(proposalId), owner],
   });
+}
+
+export async function readApprovalBatch(accountAddress: Address, proposalIds: number[], owners: Address[]) {
+  if (proposalIds.length === 0 || owners.length === 0) return [] as boolean[];
+  const results = await publicClient.multicall({
+    contracts: proposalIds.flatMap((proposalId) => owners.map((owner) => ({
+      address: accountAddress,
+      abi: accountAbi,
+      functionName: 'hasApproved' as const,
+      args: [BigInt(proposalId), owner] as const,
+    }))),
+    allowFailure: false,
+  });
+  return results as boolean[];
 }
 
 export async function readCanExecute(accountAddress: Address, proposalId: number) {
@@ -349,11 +387,19 @@ export function getWalletClient() {
 
 async function getSupportedWalletClient() {
   const walletClient = getWalletClient();
+  const [account] = await walletClient.getAddresses();
+  if (!account) throw new Error('지갑 계정을 선택해주세요.');
   const chainId = await walletClient.getChainId();
   if (chainId !== config.chainId) {
     throw new Error(`지원 네트워크가 아닙니다. 지갑 네트워크를 Chain ID ${config.chainId}로 변경해주세요.`);
   }
   return walletClient;
+}
+
+export async function getAuthorizedWallet() {
+  const walletClient = getWalletClient();
+  const [account] = await walletClient.getAddresses();
+  return account ?? null;
 }
 
 export async function connectWallet() {
@@ -429,6 +475,19 @@ export async function approveTransaction(accountAddress: Address, proposalId: nu
     address: accountAddress,
     abi: accountAbi,
     functionName: 'approveProposal',
+    args: [BigInt(proposalId)],
+    account,
+  });
+  return waitForTransaction(walletClient, hash);
+}
+
+export async function cancelProposal(accountAddress: Address, proposalId: number) {
+  const walletClient = await getSupportedWalletClient();
+  const [account] = await walletClient.getAddresses();
+  const hash = await walletClient.writeContract({
+    address: accountAddress,
+    abi: accountAbi,
+    functionName: 'cancelProposal',
     args: [BigInt(proposalId)],
     account,
   });
