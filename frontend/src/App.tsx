@@ -2,24 +2,28 @@ import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { formatEther, isAddress, type Address } from 'viem';
 import {
   approveTransaction,
+  cancelProposal,
   connectWallet,
   createAccount,
   createProposal,
   deposit,
   executeTransaction,
   executeWithPayload,
+  getAuthorizedWallet,
   makeIntentHash,
   readAccountState,
-  readApproval,
+  readApprovalBatch,
   readFactoryAccounts,
   readProposal,
+  readProposalBatch,
   readProposalCount,
 } from './lib/contract';
 import { config, hasAccountAddress, hasFactoryAddress } from './lib/config';
-import { getActivities, getAccountMetadata, getProposalMetadataList, type Activity, saveAccountMetadata, saveProposalMetadata } from './lib/api';
+import { getActivities, getAccountMetadata, getProposalMetadataList, getWalletProfile, saveAccountMetadata, saveProposalMetadata, saveWalletProfile, type Activity } from './lib/api';
 
 type View = 'home' | 'create-account' | 'account' | 'create-proposal' | 'proposal-detail' | 'result';
 type ProposalStatus = 'PENDING' | 'READY' | 'EXECUTED' | 'BLOCKED' | 'CANCELLED';
+type LiveStateStatus = 'idle' | 'loading' | 'refreshing' | 'ready' | 'error';
 
 type Owner = {
   address: string;
@@ -37,6 +41,7 @@ type Account = {
 
 type Proposal = {
   id: number;
+  proposer: Address;
   purpose: string;
   recipient: Address;
   recipientLabel: string;
@@ -68,6 +73,7 @@ const demoAccount: Account = {
 
 const demoProposal: Proposal = {
   id: 1,
+  proposer: demoOwners[0].address as Address,
   purpose: '제주도 숙소',
   recipient: '0x6666666666666666666666666666666666666666',
   recipientLabel: 'Hotel A',
@@ -110,9 +116,12 @@ function formatError(error: unknown) {
   const message = error instanceof Error ? error.message : String(error);
   if (message.includes('User rejected')) return '지갑 서명을 취소했어요.';
   if (message.includes('IntentMismatch')) return '승인한 내용과 실행 요청이 달라 실행이 차단됐어요.';
+  if (message.includes('CreatorNotOwner')) return '공동계좌 생성자는 Owner 목록에 포함되어야 해요.';
   if (message.includes('NotOwner')) return '공동계좌 참여자만 실행할 수 있어요.';
   if (message.includes('AlreadyApproved')) return '이미 동의한 Proposal이에요.';
   if (message.includes('InsufficientApprovals')) return '아직 승인 수가 부족해요.';
+  if (message.includes('NotProposer')) return 'Proposal을 만든 사람만 취소할 수 있어요.';
+  if (message.includes('ProposalNotPending')) return '이미 종료된 Proposal이에요.';
   return message || '요청을 처리하지 못했어요.';
 }
 
@@ -151,11 +160,17 @@ export function App() {
     { id: '3', type: 'PROPOSAL_CREATED', actor: { address: demoOwners[0].address, name: '정연한' }, createdAt: '오늘 10:31' },
   ]);
   const [notice, setNotice] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
+  const [profileName, setProfileName] = useState('');
+  const [profileDraft, setProfileDraft] = useState('');
+  const [showProfilePrompt, setShowProfilePrompt] = useState(false);
   const [busy, setBusy] = useState('');
   const [liveRefreshKey, setLiveRefreshKey] = useState(0);
+  const [liveStateStatus, setLiveStateStatus] = useState<LiveStateStatus>('idle');
+  const [factoryLookupComplete, setFactoryLookupComplete] = useState(!hasFactoryAddress || hasAccountAddress);
   const [depositAmount, setDepositAmount] = useState('0.10');
   const [accountName, setAccountName] = useState('제주도 여행');
   const [ownerInputs, setOwnerInputs] = useState(defaultOwners);
+  const [ownerProfileNames, setOwnerProfileNames] = useState<Record<string, string>>({});
   const [proposalForm, setProposalForm] = useState({
     purpose: '제주도 숙소',
     recipient: demoProposal.recipient,
@@ -164,15 +179,67 @@ export function App() {
     expiresAt: new Date((demoProposal.expiresAt ?? 0) * 1000).toISOString().slice(0, 16),
   });
 
+  const hasConfiguredContracts = hasFactoryAddress || hasAccountAddress;
   const isLive = Boolean(walletAddress && (hasAccountAddress || (hasFactoryAddress && account.address !== demoAccount.address)));
   const approvalReady = proposal.approvalCount >= proposal.threshold;
+  const isWalletOwner = Boolean(walletAddress && account.owners.some((owner) => owner.address.toLowerCase() === walletAddress.toLowerCase()));
+  const canApproveExecute = !isLive || isWalletOwner;
+  const canCancel = !isLive || Boolean(walletAddress && proposal.proposer.toLowerCase() === walletAddress.toLowerCase());
   const expirationPass = proposal.expiresAt === null ? null : proposal.expiresAt > Math.floor(Date.now() / 1000);
+  const ownerAddressesKey = account.owners.map((owner) => owner.address.toLowerCase()).join('|');
+  const ownerInputKey = ownerInputs.join('|').toLowerCase();
   const currentSecurity = useMemo(() => ({
     threshold: approvalReady,
     intent: true,
     expiration: expirationPass,
     executionMatch: proposal.executionMatch,
   }), [approvalReady, expirationPass, proposal.executionMatch]);
+
+  async function applyWalletSession(address: Address) {
+    setWalletAddress(address);
+    setOwnerInputs((current) => current.map((owner, index) => index === 0 && owner.toLowerCase() === demoOwners[0].address.toLowerCase() ? address : owner));
+    if (!config.backendUrl) return;
+    try {
+      const profile = await getWalletProfile(address);
+      if (profile) {
+        setProfileName(profile.name);
+        setAccount((current) => ({
+          ...current,
+          owners: current.owners.map((owner) => owner.address.toLowerCase() === address.toLowerCase() ? { ...owner, name: profile.name } : owner),
+        }));
+      } else {
+        setProfileDraft('');
+        setShowProfilePrompt(true);
+      }
+    } catch {
+      setNotice({ type: 'info', text: 'Wallet은 연결됐지만 Profile 서버를 확인하지 못했어요.' });
+    }
+  }
+
+  useEffect(() => {
+    let disposed = false;
+    void getAuthorizedWallet().then((address) => {
+      if (!disposed && address) void applyWalletSession(address);
+    }).catch(() => undefined);
+
+    const provider = window.ethereum;
+    if (!provider?.on) return () => { disposed = true; };
+    const onAccountsChanged = (...args: unknown[]) => {
+      const accounts = Array.isArray(args[0]) ? args[0] : [];
+      const address = typeof accounts[0] === 'string' ? accounts[0] as Address : null;
+      if (!address) {
+        setWalletAddress('');
+        setShowProfilePrompt(false);
+        return;
+      }
+      void applyWalletSession(address);
+    };
+    provider.on('accountsChanged', onAccountsChanged);
+    return () => {
+      disposed = true;
+      provider.removeListener?.('accountsChanged', onAccountsChanged);
+    };
+  }, []);
 
   useEffect(() => {
     if (!config.backendUrl || !account.address) return;
@@ -185,30 +252,75 @@ export function App() {
   }, [account.address]);
 
   useEffect(() => {
+    if (!config.backendUrl || account.owners.length === 0) return;
+    let disposed = false;
+    void Promise.all(account.owners.map((owner) => getWalletProfile(owner.address).catch(() => null))).then((profiles) => {
+      if (disposed) return;
+      setAccount((current) => ({
+        ...current,
+        owners: current.owners.map((owner, index) => {
+          const profile = profiles[index];
+          const fallback = demoOwners.find((demoOwner) => demoOwner.address.toLowerCase() === owner.address.toLowerCase())?.name || shorten(owner.address);
+          return { ...owner, name: profile?.name || fallback };
+        }),
+      }));
+    });
+    return () => { disposed = true; };
+  }, [account.owners.length, ownerAddressesKey]);
+
+  useEffect(() => {
+    if (!config.backendUrl) return;
+    const addresses = ownerInputs.filter((owner) => isAddress(owner));
+    if (addresses.length === 0) {
+      setOwnerProfileNames({});
+      return;
+    }
+    let disposed = false;
+    void Promise.all(addresses.map((address) => getWalletProfile(address).catch(() => null))).then((profiles) => {
+      if (disposed) return;
+      const names: Record<string, string> = {};
+      addresses.forEach((address, index) => {
+        const profile = profiles[index];
+        if (profile?.name) names[address.toLowerCase()] = profile.name;
+      });
+      setOwnerProfileNames(names);
+    });
+    return () => { disposed = true; };
+  }, [ownerInputKey]);
+
+  useEffect(() => {
     if (!walletAddress || !hasFactoryAddress || hasAccountAddress || account.address !== demoAccount.address) return;
     let disposed = false;
+    setFactoryLookupComplete(false);
     void readFactoryAccounts(walletAddress as Address).then((accounts) => {
-      if (disposed || accounts.length === 0) return;
-      setAccount((current) => ({ ...current, address: accounts[accounts.length - 1] }));
-    }).catch(() => undefined);
+      if (disposed) return;
+      if (accounts.length > 0) {
+        setAccount((current) => ({ ...current, address: accounts[accounts.length - 1] }));
+      }
+      setFactoryLookupComplete(true);
+    }).catch(() => {
+      if (!disposed) setFactoryLookupComplete(true);
+    });
     return () => { disposed = true; };
   }, [walletAddress, account.address]);
 
   useEffect(() => {
-    if (!isLive) return;
+    if (!isLive) {
+      setLiveStateStatus('idle');
+      return;
+    }
     let disposed = false;
+    setLiveStateStatus((current) => current === 'ready' ? 'refreshing' : 'loading');
     async function syncLiveState() {
       const [state, proposalCount, metadata] = await Promise.all([
         readAccountState(account.address),
         readProposalCount(account.address),
         getProposalMetadataList(account.address).catch(() => []),
       ]);
-      const records = await Promise.all(
-        Array.from({ length: Number(proposalCount) }, (_, proposalId) => readProposal(account.address, proposalId)),
-      );
-      const approvals = await Promise.all(
-        records.map((_, proposalId) => Promise.all(state.owners.map((owner) => readApproval(account.address, proposalId, owner)))),
-      );
+      const proposalIds = Array.from({ length: Number(proposalCount) }, (_, proposalId) => proposalId);
+      const records = await readProposalBatch(account.address, proposalIds);
+      const approvalValues = await readApprovalBatch(account.address, proposalIds, state.owners);
+      const approvals = proposalIds.map((_, proposalIndex) => approvalValues.slice(proposalIndex * state.owners.length, (proposalIndex + 1) * state.owners.length));
       if (disposed) return;
 
       const metadataById = new Map(metadata.map((item) => [item.proposalId, item]));
@@ -223,6 +335,7 @@ export function App() {
             : approvalCount >= state.threshold ? 'READY' : 'PENDING';
         return {
           id: proposalId,
+          proposer: record.proposer,
           purpose: proposalMetadata?.purpose || '지출 제안 #' + proposalId,
           recipient: record.target,
           recipientLabel: proposalMetadata?.recipientLabel || shorten(record.target),
@@ -242,17 +355,22 @@ export function App() {
         balance: state.balance,
         threshold: state.threshold,
         owners: state.owners.map((address) => {
-          const existing = current.owners.find((owner) => owner.address.toLowerCase() === address.toLowerCase());
-          return { address, name: existing?.name || shorten(address), approved: false };
+          const fallback = demoOwners.find((owner) => owner.address.toLowerCase() === address.toLowerCase())?.name || shorten(address);
+          return { address, name: fallback, approved: false };
         }),
       }));
       setProposals(nextProposals);
       if (nextProposals.length > 0) {
         setProposal((current) => nextProposals.find((item) => item.id === current.id) || nextProposals[nextProposals.length - 1]);
       }
+      setLiveStateStatus('ready');
     }
 
-    void syncLiveState().catch(() => undefined);
+    void syncLiveState().catch((error) => {
+      if (disposed) return;
+      setLiveStateStatus('error');
+      setError(error);
+    });
     return () => { disposed = true; };
   }, [account.address, isLive, liveRefreshKey]);
 
@@ -285,8 +403,28 @@ export function App() {
   async function handleConnect() {
     await run('connect', async () => {
       const address = await connectWallet();
-      setWalletAddress(address);
+      await applyWalletSession(address);
       setNotice({ type: 'success', text: 'Wallet이 연결됐어요.' });
+    });
+  }
+
+  async function handleSaveProfile(event: FormEvent) {
+    event.preventDefault();
+    const name = profileDraft.trim();
+    if (!name) {
+      setNotice({ type: 'error', text: '표시 이름을 입력해주세요.' });
+      return;
+    }
+    await run('profile', async () => {
+      if (!walletAddress) throw new Error('Wallet을 먼저 연결해주세요.');
+      const profile = await saveWalletProfile(walletAddress, name);
+      setProfileName(profile?.name || name);
+      setAccount((current) => ({
+        ...current,
+        owners: current.owners.map((owner) => owner.address.toLowerCase() === walletAddress.toLowerCase() ? { ...owner, name } : owner),
+      }));
+      setShowProfilePrompt(false);
+      setNotice({ type: 'success', text: 'Wallet Profile을 저장했어요.' });
     });
   }
 
@@ -297,13 +435,26 @@ export function App() {
       setNotice({ type: 'error', text: '서로 다른 유효한 Owner 주소 5개를 입력해주세요.' });
       return;
     }
+    if (hasConfiguredContracts && (!walletAddress || !hasFactoryAddress)) {
+      setNotice({ type: 'error', text: 'Factory와 Wallet 연결을 먼저 확인해주세요.' });
+      return;
+    }
+    if (hasConfiguredContracts && walletAddress && !validOwners.some((owner) => owner.toLowerCase() === walletAddress.toLowerCase())) {
+      setNotice({ type: 'error', text: '공동계좌 생성에 사용할 Owner 목록에 현재 연결된 Wallet을 포함해주세요.' });
+      return;
+    }
 
     await run('create-account', async () => {
-      if (hasFactoryAddress && walletAddress) {
+      if (hasConfiguredContracts) {
         const created = await createAccount(validOwners as Address[]);
-        await saveAccountMetadata(created.accountAddress, accountName, walletAddress, created.hash);
         setAccount((current) => ({ ...current, address: created.accountAddress }));
+        setView('account');
         setNotice({ type: 'success', text: '공동계좌 생성 Transaction이 완료됐어요.' });
+        try {
+          await saveAccountMetadata(created.accountAddress, accountName, walletAddress, created.hash);
+        } catch {
+          setNotice({ type: 'info', text: '온체인 계좌는 생성됐지만 Account metadata 저장에 실패했어요.' });
+        }
       } else {
         setNotice({ type: 'info', text: 'Demo 모드: Contract 주소가 없어 화면에서 계좌 생성을 확인했어요.' });
       }
@@ -312,7 +463,7 @@ export function App() {
         name: accountName,
         owners: validOwners.map((address, index) => ({
           address,
-          name: demoOwners[index]?.name || 'Owner ' + (index + 1),
+          name: ownerProfileNames[address.toLowerCase()] || demoOwners[index]?.name || 'Owner ' + (index + 1),
           approved: false,
         })),
       }));
@@ -329,6 +480,9 @@ export function App() {
     }
 
     await run('deposit', async () => {
+      if (hasConfiguredContracts && !isLive) {
+        throw new Error('실제 Moa 계좌를 먼저 연결해주세요. Demo 잔액은 실제 입금이 아닙니다.');
+      }
       if (isLive) {
         await deposit(account.address, depositAmount);
         setLiveRefreshKey((current) => current + 1);
@@ -357,8 +511,12 @@ export function App() {
     }
 
     await run('create-proposal', async () => {
+      if (hasConfiguredContracts && !isLive) {
+        throw new Error('실제 Moa 계좌가 확인된 뒤 Proposal을 만들 수 있어요.');
+      }
       let txHash = 'demo';
       let nextId = Math.max(0, ...proposals.map((item) => item.id)) + 1;
+      let metadataSyncFailed = false;
       let intentHash = makeIntentHash(
         account.address,
         nextId,
@@ -374,6 +532,7 @@ export function App() {
 
       const nextProposal: Proposal = {
         id: nextId,
+        proposer: (walletAddress || demoOwners[0].address) as Address,
         purpose: proposalForm.purpose,
         recipient: proposalForm.recipient as Address,
         recipientLabel: proposalForm.recipientLabel || shorten(proposalForm.recipient),
@@ -390,25 +549,43 @@ export function App() {
       setProposals((current) => [...current, nextProposal]);
       setActivities((current) => [{ id: String(Date.now()), type: 'PROPOSAL_CREATED', createdAt: '방금 전' }, ...current]);
       if (isLive) {
-        await saveProposalMetadata(account.address, nextId, proposalForm.purpose, proposalForm.recipientLabel, '', txHash);
+        try {
+          await saveProposalMetadata(account.address, nextId, proposalForm.purpose, proposalForm.recipientLabel, '', txHash);
+        } catch {
+          metadataSyncFailed = true;
+        }
         setLiveRefreshKey((current) => current + 1);
       }
-      setNotice({ type: 'success', text: isLive ? 'Proposal이 생성됐어요.' : 'Demo 모드: Proposal이 생성됐어요.' });
+      setNotice({
+        type: metadataSyncFailed ? 'info' : 'success',
+        text: metadataSyncFailed ? '온체인 Proposal은 생성됐지만 Proposal metadata 저장에 실패했어요.' : isLive ? 'Proposal이 생성됐어요.' : 'Demo 모드: Proposal이 생성됐어요.',
+      });
       setView('proposal-detail');
     });
   }
 
   async function handleApprove() {
     await run('approve', async () => {
+      if (hasConfiguredContracts && !isLive) throw new Error('실제 Moa 계좌가 확인된 뒤 승인할 수 있어요.');
+      if (isLive && !isWalletOwner) throw new Error('NotOwner');
+      let nextCount = proposal.approvalCount;
+      let approvedOwners = proposal.approvedOwners;
       if (isLive) {
         await approveTransaction(account.address, proposal.id);
+        const [latest, approvalValues] = await Promise.all([
+          readProposal(account.address, proposal.id),
+          readApprovalBatch(account.address, [proposal.id], account.owners.map((owner) => owner.address as Address)),
+        ]);
+        nextCount = Number(latest.approvalCount);
+        approvedOwners = account.owners.filter((_, index) => approvalValues[index]).map((owner) => owner.address);
         setLiveRefreshKey((current) => current + 1);
+      } else {
+        const nextSigner = walletAddress || account.owners.find((owner) => !proposal.approvedOwners.includes(owner.address))?.address;
+        approvedOwners = nextSigner && !proposal.approvedOwners.includes(nextSigner)
+          ? [...proposal.approvedOwners, nextSigner]
+          : proposal.approvedOwners;
+        nextCount = Math.min(proposal.threshold, approvedOwners.length);
       }
-      const nextSigner = walletAddress || account.owners.find((owner) => !proposal.approvedOwners.includes(owner.address))?.address;
-      const approvedOwners = nextSigner && !proposal.approvedOwners.includes(nextSigner)
-        ? [...proposal.approvedOwners, nextSigner]
-        : proposal.approvedOwners;
-      const nextCount = Math.min(proposal.threshold, approvedOwners.length);
       const nextProposal = {
         ...proposal,
         approvalCount: nextCount,
@@ -424,6 +601,8 @@ export function App() {
 
   async function handleExecute() {
     await run('execute', async () => {
+      if (hasConfiguredContracts && !isLive) throw new Error('실제 Moa 계좌가 확인된 뒤 실행할 수 있어요.');
+      if (isLive && !isWalletOwner) throw new Error('NotOwner');
       if (!approvalReady) throw new Error('InsufficientApprovals');
       if (isLive) {
         await executeTransaction(account.address, proposal.id);
@@ -438,6 +617,22 @@ export function App() {
     });
   }
 
+  async function handleCancel() {
+    await run('cancel', async () => {
+      if (hasConfiguredContracts && !isLive) throw new Error('실제 Moa 계좌가 확인된 뒤 취소할 수 있어요.');
+      if (isLive && !canCancel) throw new Error('NotProposer');
+      if (isLive) {
+        await cancelProposal(account.address, proposal.id);
+        setLiveRefreshKey((current) => current + 1);
+      }
+      const nextProposal = { ...proposal, status: 'CANCELLED' } as Proposal;
+      setProposal(nextProposal);
+      setProposals((current) => current.map((item) => item.id === proposal.id ? nextProposal : item));
+      setActivities((current) => [{ id: String(Date.now()), type: 'PROPOSAL_CANCELLED', createdAt: '방금 전' }, ...current]);
+      setNotice({ type: 'success', text: isLive ? 'Proposal을 취소했어요.' : 'Demo 모드: Proposal을 취소했어요.' });
+    });
+  }
+
   async function handleAttack() {
     if (!config.attackMode) {
       setNotice({ type: 'info', text: 'Attack Mode는 VITE_ATTACK_MODE=true일 때만 사용할 수 있어요.' });
@@ -445,6 +640,7 @@ export function App() {
     }
 
     await run('attack', async () => {
+      if (hasConfiguredContracts && !isLive) throw new Error('실제 Moa 계좌가 확인된 뒤 Attack Path를 실행할 수 있어요.');
       const attacker = '0x9999999999999999999999999999999999999999' as Address;
       if (isLive) {
         try {
@@ -480,7 +676,7 @@ export function App() {
         <div className="topbar-actions">
           <span className={'mode-pill ' + (isLive ? 'live' : '')}>
             <i />
-            {isLive ? 'LIVE NETWORK' : 'DEMO MODE'}
+            {isLive ? 'LIVE NETWORK' : hasConfiguredContracts && walletAddress ? 'ACCOUNT REQUIRED' : hasConfiguredContracts ? 'WALLET REQUIRED' : 'DEMO MODE'}
           </span>
           <button className="wallet-button" onClick={() => void handleConnect()} disabled={busy === 'connect'}>
             <span className="wallet-dot" />
@@ -492,6 +688,17 @@ export function App() {
       <main className="main-content">
         {notice && <div className={'notice ' + notice.type}>{notice.text}<button onClick={() => setNotice(null)}>×</button></div>}
 
+        {hasConfiguredContracts && !walletAddress ? (
+          <WalletRequiredPage busy={busy === 'connect'} onConnect={() => void handleConnect()} />
+        ) : hasConfiguredContracts && walletAddress && !hasAccountAddress && !factoryLookupComplete ? (
+          <NetworkLoadingPage />
+        ) : hasConfiguredContracts && walletAddress && !hasAccountAddress && factoryLookupComplete && account.address === demoAccount.address && view !== 'create-account' ? (
+          <NoAccountPage onCreate={() => nav('create-account')} />
+        ) : isLive && (liveStateStatus === 'idle' || liveStateStatus === 'loading') ? (
+          <NetworkLoadingPage />
+        ) : isLive && liveStateStatus === 'error' ? (
+          <NetworkErrorPage onRetry={() => setLiveRefreshKey((current) => current + 1)} />
+        ) : <>
         {view === 'home' && (
           <HomePage account={account} proposals={proposals} onOpenAccount={() => nav('account')} onCreateAccount={() => nav('create-account')} onOpenProposal={() => nav('proposal-detail')} />
         )}
@@ -500,6 +707,7 @@ export function App() {
           <CreateAccountPage
             name={accountName}
             owners={ownerInputs}
+            ownerProfileNames={ownerProfileNames}
             busy={busy === 'create-account'}
             onNameChange={setAccountName}
             onOwnerChange={(index, value) => setOwnerInputs((current) => current.map((owner, ownerIndex) => ownerIndex === index ? value : owner))}
@@ -547,10 +755,14 @@ export function App() {
             account={account}
             proposal={proposal}
             busy={busy}
+            isLive={isLive}
             attackMode={config.attackMode}
+            canApproveExecute={canApproveExecute}
+            canCancel={canCancel}
             onApprove={() => void handleApprove()}
             onExecute={() => void handleExecute()}
             onAttack={() => void handleAttack()}
+            onCancel={() => void handleCancel()}
             onBack={() => nav('account')}
           />
         )}
@@ -561,7 +773,7 @@ export function App() {
 
         {showActiveProposals && (
           <ActiveProposalsModal
-            proposals={proposals.filter((item) => item.status === 'PENDING' || item.status === 'READY').sort((left, right) => right.id - left.id)}
+            proposals={[...proposals].sort((left, right) => right.id - left.id)}
             onClose={() => setShowActiveProposals(false)}
             onSelect={(proposalId) => {
               setShowActiveProposals(false);
@@ -578,6 +790,16 @@ export function App() {
             onClose={() => setShowActivities(false)}
           />
         )}
+        {showProfilePrompt && (
+          <WalletProfileModal
+            name={profileDraft}
+            address={walletAddress}
+            busy={busy === 'profile'}
+            onChange={setProfileDraft}
+            onSubmit={handleSaveProfile}
+          />
+        )}
+        </>}
       </main>
 
       <footer className="footer">
@@ -586,6 +808,32 @@ export function App() {
       </footer>
     </div>
   );
+}
+
+function WalletRequiredPage({ busy, onConnect }: { busy: boolean; onConnect: () => void }) {
+  return <section className="page narrow-page"><div className="form-card wallet-required-card"><p className="eyebrow">LIVE NETWORK</p><h1>Wallet을 연결해주세요.</h1><p>실제 Sepolia 컨트랙트로 데모를 진행하려면 MetaMask 연결이 필요해요.</p><button className="primary-button full-width" onClick={onConnect} disabled={busy}>{busy ? '연결 중…' : 'MetaMask 연결하기 ↗'}</button></div></section>;
+}
+
+function NoAccountPage({ onCreate }: { onCreate: () => void }) {
+  return <section className="page narrow-page"><div className="form-card wallet-required-card"><p className="eyebrow">LIVE NETWORK</p><h1>공동계좌를 찾을 수 없어요.</h1><p>현재 연결된 Wallet이 Owner로 등록된 Moa 계좌가 없습니다. Profile 등록만으로는 공동계좌 멤버가 되지 않아요.</p><button className="primary-button full-width" onClick={onCreate}>새 공동계좌 만들기 ↗</button></div></section>;
+}
+
+function NetworkLoadingPage() {
+  return <section className="page narrow-page"><div className="form-card wallet-required-card"><p className="eyebrow">LIVE NETWORK</p><h1>온체인 계좌를 확인하는 중…</h1><p>Factory와 Moa Account에서 실제 상태를 읽고 있어요. Demo 데이터는 사용하지 않습니다.</p></div></section>;
+}
+
+function NetworkErrorPage({ onRetry }: { onRetry: () => void }) {
+  return <section className="page narrow-page"><div className="form-card wallet-required-card"><p className="eyebrow">LIVE NETWORK ERROR</p><h1>온체인 상태를 읽지 못했어요.</h1><p>RPC, 네트워크 또는 Contract 주소를 확인한 뒤 다시 시도해주세요.</p><button className="primary-button full-width" onClick={onRetry}>다시 조회하기 ↻</button></div></section>;
+}
+
+function WalletProfileModal({ name, address, busy, onChange, onSubmit }: {
+  name: string;
+  address: string;
+  busy: boolean;
+  onChange: (value: string) => void;
+  onSubmit: (event: FormEvent) => void;
+}) {
+  return <div className="modal-backdrop" role="presentation"><section className="proposal-modal profile-modal" role="dialog" aria-modal="true" aria-labelledby="wallet-profile-title"><div className="modal-header"><div><p className="eyebrow">WALLET PROFILE</p><h2 id="wallet-profile-title">표시 이름을 정해주세요</h2></div></div><p className="profile-modal-description">공동계좌에서 다른 멤버에게 보여질 이름이에요.</p><p className="profile-modal-address">{shorten(address, 7)}</p><form onSubmit={onSubmit}><label className="field-label">표시 이름<input autoFocus value={name} onChange={(event) => onChange(event.target.value)} placeholder="예: 정윤호" maxLength={100} /></label><button className="primary-button full-width profile-submit" type="submit" disabled={busy}>{busy ? '저장 중…' : 'Profile 저장하기 ↗'}</button></form></section></div>;
 }
 
 function HomePage({ account, proposals, onOpenAccount, onCreateAccount, onOpenProposal }: {
@@ -649,9 +897,10 @@ function HomePage({ account, proposals, onOpenAccount, onCreateAccount, onOpenPr
   );
 }
 
-function CreateAccountPage({ name, owners, busy, onNameChange, onOwnerChange, onSubmit, onBack }: {
+function CreateAccountPage({ name, owners, ownerProfileNames, busy, onNameChange, onOwnerChange, onSubmit, onBack }: {
   name: string;
   owners: string[];
+  ownerProfileNames: Record<string, string>;
   busy: boolean;
   onNameChange: (value: string) => void;
   onOwnerChange: (index: number, value: string) => void;
@@ -665,7 +914,7 @@ function CreateAccountPage({ name, owners, busy, onNameChange, onOwnerChange, on
         <label className="field-label">공동계좌 이름<input value={name} onChange={(event) => onNameChange(event.target.value)} placeholder="예: 제주도 여행" /></label>
         <div className="form-section-title"><span>OWNERS</span><small>5명 중 3명 동의</small></div>
         <div className="owner-inputs">
-          {owners.map((owner, index) => <label className="owner-input" key={index}><span>{index + 1}</span><input value={owner} onChange={(event) => onOwnerChange(index, event.target.value)} placeholder="0x..." /></label>)}
+          {owners.map((owner, index) => <label className="owner-input" key={index}><span>{index + 1}</span><div className="owner-input-field"><input value={owner} onChange={(event) => onOwnerChange(index, event.target.value)} placeholder="0x..." />{isAddress(owner) && <small>{ownerProfileNames[owner.toLowerCase()] || '등록된 Wallet Profile 없음'}</small>}</div></label>)}
         </div>
         <div className="threshold-preview"><span className="check-mark">✓</span><span><b>5명 중 3명이 동의하면 사용할 수 있어요.</b><small>Threshold는 MVP에서 3으로 고정돼요.</small></span></div>
         <button className="primary-button full-width" type="submit" disabled={busy}>{busy ? '생성 중…' : 'Moa 만들기 ↗'}</button>
@@ -706,7 +955,7 @@ function AccountPage({ account, proposals, activities, depositAmount, busy, onDe
 }
 
 function ActiveProposalsModal({ proposals, onClose, onSelect }: { proposals: Proposal[]; onClose: () => void; onSelect: (proposalId: number) => void }) {
-  return <div className="modal-backdrop" role="presentation" onClick={onClose}><section className="proposal-modal" role="dialog" aria-modal="true" aria-labelledby="active-proposals-title" onClick={(event) => event.stopPropagation()}><div className="modal-header"><div><p className="eyebrow">ACTIVE PROPOSALS</p><h2 id="active-proposals-title">진행 중인 지출 제안</h2></div><button className="modal-close" onClick={onClose} aria-label="팝업 닫기">×</button></div>{proposals.length === 0 ? <div className="empty-proposals"><span>✓</span><b>진행 중인 제안이 없어요.</b><small>새 지출 제안을 만들어보세요.</small></div> : <div className="proposal-list">{proposals.map((item) => <button className="proposal-list-item" key={item.id} onClick={() => onSelect(item.id)}><span className="proposal-list-icon">↗</span><span className="proposal-list-copy"><b>{item.purpose}</b><small>{item.recipientLabel} · {item.amount} ETH</small></span><span className="proposal-list-votes">{item.approvalCount} / {item.threshold}<small>동의</small></span><span className={'status-chip ' + item.status.toLowerCase()}>{item.status === 'READY' ? 'READY' : item.status}</span><span className="proposal-list-arrow">→</span></button>)}</div>}<button className="modal-secondary" onClick={onClose}>닫기</button></section></div>;
+  return <div className="modal-backdrop" role="presentation" onClick={onClose}><section className="proposal-modal" role="dialog" aria-modal="true" aria-labelledby="active-proposals-title" onClick={(event) => event.stopPropagation()}><div className="modal-header"><div><p className="eyebrow">ALL PROPOSALS</p><h2 id="active-proposals-title">전체 지출 제안</h2></div><button className="modal-close" onClick={onClose} aria-label="팝업 닫기">×</button></div>{proposals.length === 0 ? <div className="empty-proposals"><span>✓</span><b>아직 지출 제안이 없어요.</b><small>새 지출 제안을 만들어보세요.</small></div> : <div className="proposal-list">{proposals.map((item) => <button className="proposal-list-item" key={item.id} onClick={() => onSelect(item.id)}><span className="proposal-list-icon">↗</span><span className="proposal-list-copy"><b>{item.purpose}</b><small>{item.recipientLabel} · {item.amount} ETH</small></span><span className="proposal-list-votes">{item.approvalCount} / {item.threshold}<small>동의</small></span><span className={'status-chip ' + item.status.toLowerCase()}>{item.status === 'READY' ? 'READY' : item.status}</span><span className="proposal-list-arrow">→</span></button>)}</div>}<button className="modal-secondary" onClick={onClose}>닫기</button></section></div>;
 }
 
 function ActivityModal({ activities, onClose }: { activities: Activity[]; onClose: () => void }) {
@@ -717,7 +966,7 @@ function ConsensusCard({ account, activeProposals, onCreateProposal, onOpenAllPr
   const hasActiveProposal = activeProposals.length > 0;
   const visibleProposals = activeProposals.slice(0, 3);
 
-  return <div className="threshold-card consensus-card"><div className="card-heading"><span>CONSENSUS</span><span className="live-badge">{activeProposals.length} ACTIVE</span></div>{hasActiveProposal ? <><div className="active-proposal-label">ALL ACTIVE PROPOSALS</div><div className="consensus-proposal-list">{visibleProposals.map((item) => <button className="consensus-proposal-row" key={item.id} onClick={() => onSelectProposal(item.id)}><span className="consensus-proposal-icon">↗</span><span className="consensus-proposal-copy"><b>{item.purpose}</b><small>{item.recipientLabel} · {item.amount} ETH</small></span><span className="consensus-proposal-votes"><b>{item.approvalCount} / {item.threshold}</b><small>동의</small></span><span className={'status-chip ' + item.status.toLowerCase()}>{item.status === 'READY' ? 'READY' : item.status}</span><span className="consensus-proposal-progress">{account.owners.map((owner) => <i key={owner.address} className={item.approvedOwners.includes(owner.address) ? 'approved' : ''} />)}</span></button>)}</div><button className="consensus-view-all" onClick={onOpenAllProposals}>전체보기</button></> : <button className="consensus-empty" onClick={onCreateProposal}><span>＋</span><b>새 지출 제안을 만들어보세요</b><small>클릭해서 Proposal을 작성할 수 있어요.</small></button>}</div>;
+  return <div className="threshold-card consensus-card"><div className="card-heading"><span>CONSENSUS</span><span className="live-badge">{activeProposals.length} ACTIVE</span></div>{hasActiveProposal ? <><div className="active-proposal-label">ALL ACTIVE PROPOSALS</div><div className="consensus-proposal-list">{visibleProposals.map((item) => <button className="consensus-proposal-row" key={item.id} onClick={() => onSelectProposal(item.id)}><span className="consensus-proposal-icon">↗</span><span className="consensus-proposal-copy"><b>{item.purpose}</b><small>{item.recipientLabel} · {item.amount} ETH</small></span><span className="consensus-proposal-votes"><b>{item.approvalCount} / {item.threshold}</b><small>동의</small></span><span className={'status-chip ' + item.status.toLowerCase()}>{item.status === 'READY' ? 'READY' : item.status}</span><span className="consensus-proposal-progress">{account.owners.map((owner) => <i key={owner.address} className={item.approvedOwners.includes(owner.address) ? 'approved' : ''} />)}</span></button>)}</div><button className="consensus-view-all" onClick={onOpenAllProposals}>전체보기</button></> : <><button className="consensus-empty" onClick={onCreateProposal}><span>＋</span><b>새 지출 제안을 만들어보세요</b><small>클릭해서 Proposal을 작성할 수 있어요.</small></button><button className="consensus-view-all" onClick={onOpenAllProposals}>전체보기</button></> }</div>;
 }
 
 function ProposalCreatePage({ account, form, live, busy, onFormChange, onCreate, onBack }: {
@@ -732,14 +981,18 @@ function ProposalCreatePage({ account, form, live, busy, onFormChange, onCreate,
   return <section className="page narrow-page"><PageHeader eyebrow="NEW PROPOSAL" title="새 지출 제안" description="공동자금을 사용할 거래 조건을 작성해요." onBack={onBack} /><form className="proposal-create-card proposal-create-page-card" onSubmit={onCreate}><div className="proposal-form-heading"><span className="eyebrow">PROPOSAL INTENT</span><span className="step-label">01 / 01</span></div><div className="proposal-form-grid"><label>목적<input value={form.purpose} onChange={(event) => onFormChange('purpose', event.target.value)} placeholder="예: 제주도 숙소" /></label><label>금액<div className="input-suffix"><input value={form.amount} onChange={(event) => onFormChange('amount', event.target.value)} inputMode="decimal" /><span>ETH</span></div></label><label className="wide-field">받는 곳<input value={form.recipient} onChange={(event) => onFormChange('recipient', event.target.value)} placeholder="0x..." /></label><label>표시 이름<input value={form.recipientLabel} onChange={(event) => onFormChange('recipientLabel', event.target.value)} placeholder="예: Hotel A" /></label>{live ? <label>유효기간<span className="unsupported-field">컨트랙트에서 관리하지 않음</span></label> : <label>유효기간<input type="datetime-local" value={form.expiresAt} onChange={(event) => onFormChange('expiresAt', event.target.value)} /></label>}</div><div className="proposal-form-footer"><span>잔액 {account.balance} ETH · TRANSFER</span><button className="primary-button" type="submit" disabled={busy === 'create-proposal'}>{busy === 'create-proposal' ? '생성 중…' : 'Proposal 만들기 ↗'}</button></div></form></section>;
 }
 
-function ProposalPage({ account, proposal, busy, attackMode, onApprove, onExecute, onAttack, onBack }: {
+function ProposalPage({ account, proposal, busy, isLive, attackMode, canApproveExecute, canCancel, onApprove, onExecute, onAttack, onCancel, onBack }: {
   account: Account;
   proposal: Proposal;
   busy: string;
+  isLive: boolean;
   attackMode: boolean;
+  canApproveExecute: boolean;
+  canCancel: boolean;
   onApprove: () => void;
   onExecute: () => void;
   onAttack: () => void;
+  onCancel: () => void;
   onBack: () => void;
 }) {
   const ready = proposal.approvalCount >= proposal.threshold;
@@ -756,10 +1009,11 @@ function ProposalPage({ account, proposal, busy, attackMode, onApprove, onExecut
           <div className="proposal-meta-row"><span><small>EXPIRES</small><b>{formatDate(proposal.expiresAt)}</b></span><span><small>ACTION</small><b>TRANSFER</b></span><span><small>INTENT HASH</small><b>{proposal.intentHash}</b></span></div>
           <div className="approval-progress"><div className="progress-label"><span>구성원 승인</span><b>{proposal.approvalCount} / {proposal.threshold}</b></div><div className="progress-track"><i style={{ width: Math.min(100, proposal.approvalCount / proposal.threshold * 100) + '%' }} /></div></div>
           <div className="approval-avatars">{account.owners.map((owner) => <span className={proposal.approvedOwners.includes(owner.address) ? 'approved' : ''} key={owner.address}>{owner.name.slice(0, 1)}</span>)}</div>
-          {!isResult && <div className="action-row"><button className="secondary-button" onClick={onApprove} disabled={busy === 'approve' || ready}>{busy === 'approve' ? '서명 중…' : ready ? '동의 완료 ✓' : '동의하기'}</button><button className="primary-button" onClick={onExecute} disabled={!ready || busy === 'execute'}>{busy === 'execute' ? '실행 중…' : '실행하기 ↗'}</button></div>}
+          {isLive && !canApproveExecute && <p className="permission-note">현재 연결된 Wallet은 이 공동계좌의 Owner가 아니어서 동의할 수 없어요. Owner 지갑으로 연결해주세요.</p>}
+          {!isResult && proposal.status !== 'CANCELLED' && <div className="action-row"><button className="secondary-button" onClick={onApprove} disabled={!canApproveExecute || busy === 'approve' || ready}>{busy === 'approve' ? '서명 중…' : ready ? '동의 완료 ✓' : '동의하기'}</button><button className="primary-button" onClick={onExecute} disabled={!canApproveExecute || !ready || busy === 'execute'}>{busy === 'execute' ? '실행 중…' : '실행하기 ↗'}</button><button className="cancel-button" onClick={onCancel} disabled={!canCancel || busy === 'cancel'}>{busy === 'cancel' ? '취소 중…' : 'Proposal 취소'}</button></div>}
         </div>
 
-        <div className="security-card"><div className="card-heading"><span>SECURITY LAYER</span><span className="lock-icon">⌁</span></div><p className="security-lead">서명은 충분했지만,<br /><b>합의한 거래인지 다시 확인해요.</b></p><SecurityRow label="Threshold" status={proposal.approvalCount >= proposal.threshold ? 'PASS' : 'WAIT'} value={proposal.approvalCount + ' / ' + proposal.threshold} /><SecurityRow label="Intent" status="PASS" value={shorten(proposal.intentHash, 7)} /><SecurityRow label="Expiration" status={proposal.expiresAt === null ? 'WAIT' : proposal.expiresAt > Math.floor(Date.now() / 1000) ? 'PASS' : 'FAIL'} value={formatDate(proposal.expiresAt)} /><SecurityRow label="Execution Match" status={proposal.executionMatch || 'WAIT'} value={proposal.executionMatch === 'FAIL' ? 'Recipient mismatch' : proposal.executionMatch === 'PASS' ? 'All fields match' : '검증 대기'} />{attackMode && !isResult && ready && <button className="attack-button" onClick={onAttack} disabled={busy === 'attack'}><span>⚠</span>{busy === 'attack' ? '공격 시뮬레이션 중…' : 'Attack Path 실행'}</button>}</div>
+        <div className="security-card"><div className="card-heading"><span>SECURITY LAYER</span><span className="lock-icon">⌁</span></div><p className="security-lead">서명은 충분했지만,<br /><b>합의한 거래인지 다시 확인해요.</b></p><SecurityRow label="Threshold" status={proposal.approvalCount >= proposal.threshold ? 'PASS' : 'WAIT'} value={proposal.approvalCount + ' / ' + proposal.threshold} /><SecurityRow label="Intent" status="PASS" value={shorten(proposal.intentHash, 7)} /><SecurityRow label="Expiration" status={proposal.expiresAt === null ? 'WAIT' : proposal.expiresAt > Math.floor(Date.now() / 1000) ? 'PASS' : 'FAIL'} value={formatDate(proposal.expiresAt)} /><SecurityRow label="Execution Match" status={proposal.executionMatch || 'WAIT'} value={proposal.executionMatch === 'FAIL' ? 'Recipient mismatch' : proposal.executionMatch === 'PASS' ? 'All fields match' : '검증 대기'} />{attackMode && !isResult && ready && canApproveExecute && <button className="attack-button" onClick={onAttack} disabled={busy === 'attack'}><span>⚠</span>{busy === 'attack' ? '공격 시뮬레이션 중…' : 'Attack Path 실행'}</button>}</div>
       </div>
     </section>
   );
@@ -793,6 +1047,7 @@ function activityLabel(type: string) {
     EXECUTION_REQUESTED: '실행 요청',
     EXECUTION_BLOCKED: '실행 차단',
     PROPOSAL_EXECUTED: '지출 실행 완료',
+    PROPOSAL_CANCELLED: '지출 제안 취소',
   };
   return labels[type] || type;
 }
